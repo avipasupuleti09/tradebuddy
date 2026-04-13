@@ -1,0 +1,20 @@
+{
+  "name": "tradebuddy-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n py,scanner,vite -c blue,magenta,green \".venv\\Scripts\\python.exe server.py\" \"node --env-file=.env scanner/index.js\" \"npm --prefix frontend run dev -- --host 0.0.0.0\"",
+    "dev:py": ".venv\\Scripts\\python.exe server.py",
+    "dev:scanner": "node --env-file=.env scanner/index.js",
+    "dev:frontend": "npm --prefix frontend run dev -- --host 0.0.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

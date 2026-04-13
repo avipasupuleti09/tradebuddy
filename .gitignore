@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+.tokens/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+**/node_modules/
+
+# Build output
+frontend/dist/
+
+# Logs
+*.log
+
+# Cache & data artifacts
+.cache/
+.data/
+data/
