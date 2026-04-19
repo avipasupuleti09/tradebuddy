@@ -910,6 +910,16 @@ export default function App() {
   });
 
   const search = useMemo(() => new URLSearchParams(window.location.search), []);
+  const homeMarketRows = useMemo(() => {
+    const rowMap = new Map();
+    watchlist.forEach((item) => {
+      const symbol = item?.n || item?.v?.symbol;
+      if (symbol) {
+        rowMap.set(symbol, item);
+      }
+    });
+    return HOME_MARKET_SYMBOLS.map((symbol) => rowMap.get(symbol) || { n: symbol, v: { symbol } });
+  }, [watchlist]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", themeMode);
@@ -1326,16 +1336,6 @@ export default function App() {
   const trades = dashboard?.tradebook?.tradeBook || dashboard?.tradebook?.tradebook || [];
   const watchlistSymbols = normalizeSymbols(settings.watchlistSymbols);
   const summary = dashboard?.summary || {};
-  const homeMarketRows = useMemo(() => {
-    const rowMap = new Map();
-    watchlist.forEach((item) => {
-      const symbol = item?.n || item?.v?.symbol;
-      if (symbol) {
-        rowMap.set(symbol, item);
-      }
-    });
-    return HOME_MARKET_SYMBOLS.map((symbol) => rowMap.get(symbol) || { n: symbol, v: { symbol } });
-  }, [watchlist]);
 
   const PAGE_TITLES = {
     "/dashboard": "Home Page",

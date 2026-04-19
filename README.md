@@ -37,6 +37,39 @@ FRONTEND_URL=http://localhost:5173
 
 Important: the same redirect URI must be configured in your FYERS app settings.
 
+## Hosted Deployment
+
+This repository can now be deployed as a single Node entrypoint that serves the built React app, exposes the scanner routes, and proxies `/api/*` to the FYERS backend.
+
+Recommended hosting settings:
+
+```text
+Root directory: /
+Build command: npm install
+Start command: npm start
+Node version: 22.x
+```
+
+Required environment variables for a deployed domain:
+
+```text
+FRONTEND_URL=https://your-domain.example
+FYERS_REDIRECT_URI=https://your-domain.example/api/auth/callback
+FYERS_PAPER_TRADE_MODE=true
+```
+
+Python backend options:
+
+1. Same host, Python available:
+Set `PYTHON_AUTOSTART=true` or leave `PYTHON_API_BASE` unset. The Node server will try to start `server.py`.
+
+2. Separate Python API service:
+Set `PYTHON_API_BASE=https://your-python-api.example` and optionally `SKIP_PYTHON_BOOTSTRAP=true`.
+
+Static IP guard note:
+
+If your hosting plan does not provide a fixed outbound IP for live trading requests, either set a real value for `FYERS_ORDER_STATIC_IP` or disable the guard with `FYERS_ENFORCE_STATIC_IP_CHECK=false`. Paper mode does not require the static IP check anymore.
+
 ## 2) Run Backend API
 
 ```powershell

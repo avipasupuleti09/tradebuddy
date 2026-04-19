@@ -4,6 +4,7 @@
 
 # Python
 .venv/
+.venv-hosting/
 __pycache__/
 *.pyc
 *.pyo

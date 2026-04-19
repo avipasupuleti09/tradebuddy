@@ -28,7 +28,7 @@ def create_app() -> Flask:
     sock = Sock(app)
 
     settings = Settings.from_env()
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
     symbol_master = SymbolMaster()
     watchlist_file = Path(os.getenv("WATCHLIST_FILE", ".data/watchlists.json")).resolve()
     analytics_cache_file = Path(os.getenv("NSE_ANALYTICS_CACHE_FILE", ".cache/nse_analytics_cache.json")).resolve()
@@ -39,6 +39,14 @@ def create_app() -> Flask:
     _ANALYTICS_HISTORY_YEARS = 8
     _ANALYTICS_CHUNK_DAYS = 1500
     _ANALYTICS_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+    def resolve_frontend_url() -> str:
+        if frontend_url:
+            return frontend_url
+
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+        forwarded_host = request.headers.get("X-Forwarded-Host", request.host)
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
 
     def load_api() -> FyersApiService:
         token_payload = TokenStore(settings.token_file).load()
@@ -171,15 +179,16 @@ def create_app() -> Flask:
         if not auth_code:
             return jsonify({"status": "error", "message": "auth_code missing"}), 400
 
+        target_frontend_url = resolve_frontend_url()
         auth_service = FyersAuthService(settings)
         try:
             result = auth_service.exchange_auth_code(auth_code)
             TokenStore(settings.token_file).save(result.to_dict())
             query = urlencode({"login": "success"})
-            return redirect(f"{frontend_url}/?{query}")
+            return redirect(f"{target_frontend_url}/?{query}")
         except Exception as exc:
             query = urlencode({"login": "error", "reason": str(exc)})
-            return redirect(f"{frontend_url}/?{query}")
+            return redirect(f"{target_frontend_url}/?{query}")
 
     @app.get("/api/session")
     def session_status() -> tuple[dict, int]:
@@ -229,12 +238,6 @@ def create_app() -> Flask:
 
     @app.post("/api/orders")
     def place_order() -> tuple[dict, int]:
-        try:
-            validated_ip = ensure_static_ip(settings)
-            api = load_api()
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}, 400
-
         payload = request.get_json(silent=True) or {}
 
         try:
@@ -257,6 +260,11 @@ def create_app() -> Flask:
         if not symbol or qty < 1:
             return {"status": "error", "message": "symbol and qty are required."}, 400
 
+        try:
+            api = load_api()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}, 400
+
         order_payload = {
             "symbol": symbol,
             "qty": qty,
@@ -275,6 +283,7 @@ def create_app() -> Flask:
         if order_type == "LIMIT" and limit_price <= 0:
             return {"status": "error", "message": "limitPrice must be > 0 for LIMIT orders."}, 400
 
+        validated_ip = None
         if settings.paper_trade_mode and not force_live:
             return {
                 "status": "ok",
@@ -282,6 +291,11 @@ def create_app() -> Flask:
                 "validated_public_ip": validated_ip,
                 "simulated_order": order_payload,
             }, 200
+
+        try:
+            validated_ip = ensure_static_ip(settings)
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}, 400
 
         response = api.place_order(order_payload)
         return {
@@ -294,7 +308,6 @@ def create_app() -> Flask:
     @app.post("/api/strategy/run")
     def run_strategy() -> tuple[dict, int]:
         try:
-            validated_ip = ensure_static_ip(settings)
             api = load_api()
         except Exception as exc:
             return {"status": "error", "message": str(exc)}, 400
@@ -314,6 +327,8 @@ def create_app() -> Flask:
 
         if not symbol or qty < 1 or trigger_ltp <= 0:
             return {"status": "error", "message": "symbol, qty, and triggerLtp are required."}, 400
+
+        validated_ip = None
 
         quotes_response = api.quotes([symbol])
         data = quotes_response.get("d", [])
@@ -360,6 +375,11 @@ def create_app() -> Flask:
                 "current_ltp": ltp_value,
                 "simulated_order": order_payload,
             }, 200
+
+        try:
+            validated_ip = ensure_static_ip(settings)
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}, 400
 
         response = api.place_order(order_payload)
         return {
