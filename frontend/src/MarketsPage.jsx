@@ -4,7 +4,7 @@ import {
   searchSymbols,
   fetchQuotes,
   fetchHistory,
-  fetchWatchlists,
+  fetchWatchlistCatalog,
   createWatchlist,
   deleteWatchlist,
   addSymbolToWatchlist,
@@ -113,12 +113,49 @@ const DAYS_OPTIONS = [
   { days: 7300, label: "All" },
 ];
 
+const FALLBACK_PREDEFINED_WATCHLISTS = [
+  { id: "nifty50", name: "NIFTY 50", symbols: ["NSE:NIFTY50-INDEX", "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ", "NSE:INFY-EQ"] },
+  { id: "banking", name: "Banking Leaders", symbols: ["NSE:NIFTYBANK-INDEX", "NSE:SBIN-EQ", "NSE:AXISBANK-EQ", "NSE:KOTAKBANK-EQ", "NSE:INDUSINDBK-EQ"] },
+  { id: "it", name: "IT Leaders", symbols: ["NSE:NIFTYIT-INDEX", "NSE:TCS-EQ", "NSE:INFY-EQ", "NSE:HCLTECH-EQ", "NSE:WIPRO-EQ"] },
+];
+
+const FALLBACK_SMART_WATCHLISTS = [
+  { id: "momentum", name: "Momentum Radar", symbols: ["NSE:ADANIENT-EQ", "NSE:TATAMOTORS-EQ", "NSE:LT-EQ", "NSE:BHARTIARTL-EQ", "NSE:BAJFINANCE-EQ"] },
+  { id: "defensive", name: "Defensive Picks", symbols: ["NSE:HINDUNILVR-EQ", "NSE:NESTLEIND-EQ", "NSE:ITC-EQ", "NSE:ASIANPAINT-EQ", "NSE:DMART-EQ"] },
+  { id: "swing", name: "Swing Candidates", symbols: ["NSE:MARUTI-EQ", "NSE:ULTRACEMCO-EQ", "NSE:TITAN-EQ", "NSE:POWERGRID-EQ", "NSE:ONGC-EQ"] },
+];
+
 /* ─── Main component ──────────────────────────────────────────────────────── */
 export default function MarketsPage() {
+  const WATCH_TABS = {
+    MY: "my",
+    PREDEFINED: "predefined",
+    SMART: "smart",
+  };
+
   // Watchlists state
   const [watchlists, setWatchlists] = useState({});
   const [activeList, setActiveList] = useState(null);
   const [newListName, setNewListName] = useState("");
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [watchTab, setWatchTab] = useState(WATCH_TABS.MY);
+  const [predefinedLists, setPredefinedLists] = useState(FALLBACK_PREDEFINED_WATCHLISTS);
+  const [smartLists, setSmartLists] = useState(FALLBACK_SMART_WATCHLISTS);
+  const [activePredefined, setActivePredefined] = useState(FALLBACK_PREDEFINED_WATCHLISTS[0].id);
+  const [activeSmart, setActiveSmart] = useState(FALLBACK_SMART_WATCHLISTS[0].id);
+  const [smartMode, setSmartMode] = useState("screeners");
+  const [smartListQuery, setSmartListQuery] = useState("");
+  const [smartSymbolQuery, setSmartSymbolQuery] = useState("");
+  const [showSmartListMenu, setShowSmartListMenu] = useState(false);
+  const [showSmartSortPanel, setShowSmartSortPanel] = useState(false);
+  const [showSmartActionsMenu, setShowSmartActionsMenu] = useState(false);
+  const [smartSortBy, setSmartSortBy] = useState("chgp");
+  const [smartExchanges, setSmartExchanges] = useState(["NSE", "BSE", "MCX"]);
+  const [smartSortDraft, setSmartSortDraft] = useState("chgp");
+  const [smartExchangesDraft, setSmartExchangesDraft] = useState(["NSE", "BSE", "MCX"]);
+  const smartListMenuRef = useRef(null);
+  const smartSortPanelRef = useRef(null);
+  const smartActionsMenuRef = useRef(null);
 
   // Symbol search
   const [searchQuery, setSearchQuery] = useState("");
@@ -128,6 +165,7 @@ export default function MarketsPage() {
 
   // Quotes for active watchlist
   const [quotes, setQuotes] = useState({});
+  const [quotesUpdatedAt, setQuotesUpdatedAt] = useState(null);
   const quotesTimer = useRef(null);
 
   // selected row for chart
@@ -139,6 +177,7 @@ export default function MarketsPage() {
   const [chartLoading, setChartLoading] = useState(false);
   const [resolution, setResolution] = useState("5");
   const [days, setDays] = useState(5);
+  const [isDarkTheme, setIsDarkTheme] = useState(() => document.documentElement.getAttribute("data-theme") === "dark");
   const [logScale, setLogScale] = useState(false);
   const [percentScale, setPercentScale] = useState(false);
   const [autoScale, setAutoScale] = useState(true);
@@ -150,10 +189,71 @@ export default function MarketsPage() {
 
   const [error, setError] = useState("");
 
+  const activePredefinedList = predefinedLists.find((item) => item.id === activePredefined) || predefinedLists[0];
+  const smartPortfolioLists = smartLists.filter((item) => /holding|position|trade|portfolio/i.test(`${item.id} ${item.name}`));
+  const smartScreenerLists = smartLists.filter((item) => !/holding|position|trade|portfolio/i.test(`${item.id} ${item.name}`));
+  const smartVisibleLists = smartMode === "portfolio"
+    ? (smartPortfolioLists.length ? smartPortfolioLists : smartLists)
+    : (smartScreenerLists.length ? smartScreenerLists : smartLists);
+  const activeSmartList = smartVisibleLists.find((item) => item.id === activeSmart) || smartVisibleLists[0];
+  const listNames = Object.keys(watchlists);
+
+  const activeSymbols =
+    watchTab === WATCH_TABS.MY
+      ? (activeList ? (watchlists[activeList] || []) : [])
+      : watchTab === WATCH_TABS.PREDEFINED
+        ? (activePredefinedList?.symbols || [])
+        : (activeSmartList?.symbols || []);
+
+  const smartFilteredLists = smartVisibleLists.filter((item) => item.name.toLowerCase().includes(smartListQuery.trim().toLowerCase()));
+
+  const normalizeExchange = (symbol) => {
+    const value = String(symbol || "");
+    const prefix = value.split(":")[0] || "NSE";
+    return prefix.toUpperCase();
+  };
+
+  const smartDisplaySymbols = (() => {
+    if (watchTab !== WATCH_TABS.SMART) return activeSymbols;
+    const query = smartSymbolQuery.trim().toLowerCase();
+    const filtered = activeSymbols.filter((symbol) => {
+      const exchange = normalizeExchange(symbol);
+      if (!smartExchanges.includes(exchange)) return false;
+      if (!query) return true;
+      return symbol.toLowerCase().includes(query);
+    });
+
+    const sorted = [...filtered];
+    if (smartSortBy === "alpha") {
+      sorted.sort((a, b) => a.localeCompare(b));
+    } else if (smartSortBy === "ltp") {
+      sorted.sort((a, b) => Number(quotes[b]?.lp || 0) - Number(quotes[a]?.lp || 0));
+    } else if (smartSortBy === "chg") {
+      sorted.sort((a, b) => Number(quotes[b]?.ch || 0) - Number(quotes[a]?.ch || 0));
+    } else if (smartSortBy === "chgp") {
+      sorted.sort((a, b) => Number(quotes[b]?.chp || 0) - Number(quotes[a]?.chp || 0));
+    }
+    return sorted;
+  })();
+
+  const activeCollectionName =
+    watchTab === WATCH_TABS.MY
+      ? (activeList || "")
+      : watchTab === WATCH_TABS.PREDEFINED
+        ? activePredefinedList?.name
+        : activeSmartList?.name;
+
   /* ── Load watchlists on mount ── */
   useEffect(() => {
     loadWatchlists();
   }, []);
+
+  useEffect(() => {
+    if (!smartVisibleLists.length) return;
+    if (!smartVisibleLists.some((item) => item.id === activeSmart)) {
+      setActiveSmart(smartVisibleLists[0].id);
+    }
+  }, [smartMode, smartLists]);
 
   /* ── Close interval dropdown on outside click ── */
   useEffect(() => {
@@ -161,12 +261,21 @@ export default function MarketsPage() {
       if (intervalDropdownRef.current && !intervalDropdownRef.current.contains(e.target)) {
         setShowIntervalDropdown(false);
       }
+      if (smartListMenuRef.current && !smartListMenuRef.current.contains(e.target)) {
+        setShowSmartListMenu(false);
+      }
+      if (smartSortPanelRef.current && !smartSortPanelRef.current.contains(e.target)) {
+        setShowSmartSortPanel(false);
+      }
+      if (smartActionsMenuRef.current && !smartActionsMenuRef.current.contains(e.target)) {
+        setShowSmartActionsMenu(false);
+      }
     }
-    if (showIntervalDropdown) {
+    if (showIntervalDropdown || showSmartListMenu || showSmartSortPanel || showSmartActionsMenu) {
       document.addEventListener("mousedown", handleClickOutside);
       return () => document.removeEventListener("mousedown", handleClickOutside);
     }
-  }, [showIntervalDropdown]);
+  }, [showIntervalDropdown, showSmartListMenu, showSmartSortPanel, showSmartActionsMenu]);
 
   function toggleBookmark(value) {
     setBookmarkedIntervals((prev) => {
@@ -181,12 +290,31 @@ export default function MarketsPage() {
 
   async function loadWatchlists() {
     try {
-      const data = await fetchWatchlists();
-      setWatchlists(data.watchlists || {});
+      const data = await fetchWatchlistCatalog();
+      const myWatchlists = data?.tabs?.my?.watchlists || {};
+      const incomingPredefined = data?.tabs?.predefined?.lists || [];
+      const incomingSmart = data?.tabs?.smart?.lists || [];
+      const effectivePredefined = incomingPredefined.length ? incomingPredefined : FALLBACK_PREDEFINED_WATCHLISTS;
+      const effectiveSmart = incomingSmart.length ? incomingSmart : FALLBACK_SMART_WATCHLISTS;
+
+      setWatchlists(myWatchlists);
+      setPredefinedLists(effectivePredefined);
+      setSmartLists(effectiveSmart);
+
       // Auto-select first list if nothing selected
-      const keys = Object.keys(data.watchlists || {});
+      const keys = Object.keys(myWatchlists);
       if (keys.length && !activeList) {
         setActiveList(keys[0]);
+      }
+
+      const nextPredefined = effectivePredefined[0];
+      const nextSmart = effectiveSmart[0];
+
+      if (nextPredefined && !effectivePredefined.some((item) => item.id === activePredefined)) {
+        setActivePredefined(nextPredefined.id);
+      }
+      if (nextSmart && !effectiveSmart.some((item) => item.id === activeSmart)) {
+        setActiveSmart(nextSmart.id);
       }
     } catch (err) {
       setError(err.message);
@@ -196,12 +324,12 @@ export default function MarketsPage() {
   /* ── Live quotes polling for active watchlist ── */
   useEffect(() => {
     if (quotesTimer.current) clearInterval(quotesTimer.current);
-    if (!activeList || !watchlists[activeList]?.length) {
+    if (!activeSymbols.length) {
       setQuotes({});
       return;
     }
 
-    const symbols = watchlists[activeList];
+    const symbols = activeSymbols;
     const poll = async () => {
       try {
         const data = await fetchQuotes(symbols);
@@ -211,6 +339,7 @@ export default function MarketsPage() {
           if (sym) map[sym] = item.v || {};
         });
         setQuotes(map);
+        setQuotesUpdatedAt(new Date());
       } catch {
         /* silently retry */
       }
@@ -219,7 +348,7 @@ export default function MarketsPage() {
     poll();
     quotesTimer.current = setInterval(poll, 5000);
     return () => clearInterval(quotesTimer.current);
-  }, [activeList, watchlists]);
+  }, [activeSymbols]);
 
   /* ── Debounced symbol search ── */
   const doSearch = useCallback(
@@ -244,6 +373,15 @@ export default function MarketsPage() {
   useEffect(() => {
     doSearch(searchQuery);
   }, [searchQuery, doSearch]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const syncTheme = () => setIsDarkTheme(root.getAttribute("data-theme") === "dark");
+    syncTheme();
+    const observer = new MutationObserver(syncTheme);
+    observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => observer.disconnect();
+  }, []);
 
   /* ── Chart loading ── */
   const [ohlcInfo, setOhlcInfo] = useState(null); // crosshair hover info
@@ -292,28 +430,44 @@ export default function MarketsPage() {
     }
 
     const container = chartContainerRef.current;
+    const chartColors = isDarkTheme
+      ? {
+          bg: "#0a1830",
+          text: "#c5d7f4",
+          grid: "rgba(129, 170, 233, 0.14)",
+          border: "rgba(129, 170, 233, 0.22)",
+          volume: "rgba(146, 184, 242, 0.36)",
+        }
+      : {
+          bg: "#ffffff",
+          text: "#2a3547",
+          grid: "#f0f0f0",
+          border: "#e0e0e0",
+          volume: "#c8d6f7",
+        };
+
     const chart = createChart(container, {
       width: container.clientWidth,
       height: container.clientHeight || 480,
       layout: {
-        background: { type: ColorType.Solid, color: "#ffffff" },
-        textColor: "#2a3547",
+        background: { type: ColorType.Solid, color: chartColors.bg },
+        textColor: chartColors.text,
         fontSize: 11,
       },
       grid: {
-        vertLines: { color: "#f0f0f0" },
-        horzLines: { color: "#f0f0f0" },
+        vertLines: { color: chartColors.grid },
+        horzLines: { color: chartColors.grid },
       },
       crosshair: { mode: CrosshairMode.Normal },
       handleScroll: { mouseWheel: true, pressedMouseMove: true, vertTouchDrag: true },
       handleScale: { axisPressedMouseMove: { price: true, time: true }, mouseWheel: true, pinch: true },
       rightPriceScale: {
-        borderColor: "#e0e0e0",
+        borderColor: chartColors.border,
         autoScale: true,
         mode: 0, // Normal
       },
       timeScale: {
-        borderColor: "#e0e0e0",
+        borderColor: chartColors.border,
         timeVisible: true,
         secondsVisible: false,
       },
@@ -340,7 +494,7 @@ export default function MarketsPage() {
 
     // --- Volume histogram ---
     const volumeSeries = chart.addSeries(HistogramSeries, {
-      color: "#c8d6f7",
+      color: chartColors.volume,
       priceFormat: { type: "volume" },
       priceScaleId: "volume",
     });
@@ -382,7 +536,7 @@ export default function MarketsPage() {
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
     };
-  }, [chartData]);
+  }, [chartData, isDarkTheme]);
 
   /* ── Live tick-by-tick updates (poll every 1s) ── */
   useEffect(() => {
@@ -450,12 +604,14 @@ export default function MarketsPage() {
       setWatchlists(data.watchlists || {});
       setActiveList(name);
       setNewListName("");
+      setShowCreateModal(false);
     } catch (err) {
       setError(err.message);
     }
   }
 
   async function handleDeleteList(name) {
+    if (!window.confirm(`Delete watchlist "${name}"? This cannot be undone.`)) return;
     try {
       const data = await deleteWatchlist(name);
       setWatchlists(data.watchlists || {});
@@ -490,8 +646,53 @@ export default function MarketsPage() {
     }
   }
 
-  const listNames = Object.keys(watchlists);
-  const activeSymbols = activeList ? (watchlists[activeList] || []) : [];
+  async function handleSmartAddToMyWatchlist() {
+    if (!activeList) {
+      setError("Create or select a list in My Watchlist first.");
+      return;
+    }
+    const symbol = selectedSymbol || smartDisplaySymbols[0];
+    if (!symbol) return;
+    try {
+      await addSymbolToWatchlist(activeList, symbol);
+      await loadWatchlists();
+      setShowSmartActionsMenu(false);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  function handleSmartApplySortFilter() {
+    setSmartSortBy(smartSortDraft);
+    setSmartExchanges(smartExchangesDraft);
+    setShowSmartSortPanel(false);
+  }
+
+  function handleSmartResetSortFilter() {
+    const defaults = ["NSE", "BSE", "MCX"];
+    setSmartSortDraft("chgp");
+    setSmartExchangesDraft(defaults);
+    setSmartSortBy("chgp");
+    setSmartExchanges(defaults);
+    setShowSmartSortPanel(false);
+  }
+
+  async function refreshCurrentQuotes() {
+    try {
+      const symbols = watchTab === WATCH_TABS.SMART ? smartDisplaySymbols : activeSymbols;
+      if (!symbols.length) return;
+      const data = await fetchQuotes(symbols);
+      const map = {};
+      (data.d || []).forEach((item) => {
+        const sym = item.n || item.v?.symbol;
+        if (sym) map[sym] = item.v || {};
+      });
+      setQuotes(map);
+      setQuotesUpdatedAt(new Date());
+    } catch {
+      /* ignore manual refresh errors */
+    }
+  }
 
   function handleRowClick(symbol) {
     setSelectedSymbol(symbol);
@@ -503,36 +704,238 @@ export default function MarketsPage() {
       {error && <p className="error-bar">{error}</p>}
 
       <div className="markets-layout">
-        {/* ─── Left: FYERS-style compact watchlist ─── */}
-        <div className="fwl-panel">
-          {/* Header: watchlist selector + create */}
-          <div className="fwl-header">
-            <div className="fwl-select-row">
-              <select
-                className="fwl-select"
-                value={activeList || ""}
-                onChange={(e) => setActiveList(e.target.value)}
-              >
-                {listNames.map((n) => <option key={n} value={n}>{n}</option>)}
-              </select>
-              {activeList && (
-                <button className="fwl-del-btn" title="Delete this watchlist" onClick={() => handleDeleteList(activeList)}>×</button>
-              )}
-              <button className="fwl-add-btn" title="Create new watchlist" onClick={() => {
-                const name = newListName.trim() || prompt("Watchlist name:");
-                if (name) { setNewListName(name); setTimeout(handleCreateList, 0); }
-              }}>+</button>
-            </div>
-            <div className="fwl-create-inline">
+        {/* ─── Create Watchlist Modal ─── */}
+        {showCreateModal && (
+          <div className="fwl-modal-overlay" onClick={() => { setShowCreateModal(false); setNewListName(""); }}>
+            <div className="fwl-modal" onClick={(e) => e.stopPropagation()}>
+              <h3 className="fwl-modal-title">New Watchlist</h3>
               <input
-                placeholder="New list name…"
+                className="fwl-modal-input"
+                placeholder="Enter watchlist name…"
                 value={newListName}
                 onChange={(e) => setNewListName(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleCreateList()}
+                autoFocus
               />
-              <button className="btn-primary btn-xs" onClick={handleCreateList} disabled={!newListName.trim()}>Create</button>
+              <div className="fwl-modal-actions">
+                <button className="btn-secondary btn-sm" onClick={() => { setShowCreateModal(false); setNewListName(""); }}>Cancel</button>
+                <button className="btn-primary btn-sm" onClick={handleCreateList} disabled={!newListName.trim()}>Create</button>
+              </div>
             </div>
           </div>
+        )}
+
+        {/* ─── Left: FYERS-style compact watchlist ─── */}
+        <div className="fwl-panel">
+          <div className="fwl-tabs">
+            <button
+              className={`fwl-tab${watchTab === WATCH_TABS.MY ? " active" : ""}`}
+              onClick={() => setWatchTab(WATCH_TABS.MY)}
+            >
+              My Watchlist
+            </button>
+            <button
+              className={`fwl-tab${watchTab === WATCH_TABS.PREDEFINED ? " active" : ""}`}
+              onClick={() => setWatchTab(WATCH_TABS.PREDEFINED)}
+            >
+              Predefined
+            </button>
+            <button
+              className={`fwl-tab${watchTab === WATCH_TABS.SMART ? " active" : ""}`}
+              onClick={() => setWatchTab(WATCH_TABS.SMART)}
+            >
+              Smart Watchlist
+            </button>
+          </div>
+
+          {watchTab === WATCH_TABS.SMART && (
+            <div className="fwl-smart-subtabs">
+              <button
+                className={`fwl-smart-subtab${smartMode === "screeners" ? " active" : ""}`}
+                onClick={() => setSmartMode("screeners")}
+              >
+                My Screeners
+              </button>
+              <button
+                className={`fwl-smart-subtab${smartMode === "portfolio" ? " active" : ""}`}
+                onClick={() => setSmartMode("portfolio")}
+              >
+                Portfolio
+              </button>
+            </div>
+          )}
+
+          {/* Header: watchlist selector + add/delete */}
+          <div className="fwl-header">
+            <div className="fwl-select-row">
+              {watchTab === WATCH_TABS.MY ? (
+                <>
+                  <select
+                    className="fwl-select"
+                    value={activeList || ""}
+                    onChange={(e) => setActiveList(e.target.value)}
+                  >
+                    {listNames.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                  {activeList && (
+                    <button className="fwl-del-btn" title="Delete this watchlist" onClick={() => handleDeleteList(activeList)}>×</button>
+                  )}
+                  <button className="fwl-add-btn" title="Create new watchlist" onClick={() => setShowCreateModal(true)}>+</button>
+                </>
+              ) : watchTab === WATCH_TABS.PREDEFINED ? (
+                <select
+                  className="fwl-select"
+                  value={activePredefined}
+                  onChange={(e) => {
+                    setActivePredefined(e.target.value);
+                  }}
+                >
+                  {predefinedLists.map((n) => (
+                    <option key={n.id} value={n.id}>{n.name}</option>
+                  ))}
+                </select>
+              ) : (
+                <>
+                  <div className="fwl-smart-picker" ref={smartListMenuRef}>
+                    <button
+                      className="fwl-smart-picker-btn"
+                      onClick={() => setShowSmartListMenu((v) => !v)}
+                    >
+                      <span>{activeCollectionName || "Select screener"}</span>
+                      <span className={`fwl-caret${showSmartListMenu ? " open" : ""}`}>⌄</span>
+                    </button>
+                    {showSmartListMenu && (
+                      <div className="fwl-smart-picker-menu">
+                        <input
+                          className="fwl-search-input"
+                          placeholder="Search screeners"
+                          value={smartListQuery}
+                          onChange={(e) => setSmartListQuery(e.target.value)}
+                        />
+                        <div className="fwl-smart-picker-items">
+                          {smartFilteredLists.map((item) => (
+                            <button
+                              key={item.id}
+                              className={`fwl-smart-picker-item${activeSmart === item.id ? " active" : ""}`}
+                              onClick={() => { setActiveSmart(item.id); setShowSmartListMenu(false); }}
+                            >
+                              {item.name}
+                            </button>
+                          ))}
+                          {smartFilteredLists.length === 0 && (
+                            <p className="fwl-hint">No screener match.</p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="fwl-smart-tools">
+                    <div className="fwl-smart-tool-wrap" ref={smartSortPanelRef}>
+                      <button
+                        className="fwl-smart-tool-btn"
+                        title="Sort and filter"
+                        onClick={() => setShowSmartSortPanel((v) => !v)}
+                      >
+                        ⊣
+                      </button>
+                      {showSmartSortPanel && (
+                        <div className="fwl-smart-popover fwl-smart-sort-panel">
+                          <p className="fwl-smart-pop-title">Sort by</p>
+                          <label><input type="radio" name="smart-sort" checked={smartSortDraft === "chgp"} onChange={() => setSmartSortDraft("chgp")} /> % Change</label>
+                          <label><input type="radio" name="smart-sort" checked={smartSortDraft === "chg"} onChange={() => setSmartSortDraft("chg")} /> Change</label>
+                          <label><input type="radio" name="smart-sort" checked={smartSortDraft === "ltp"} onChange={() => setSmartSortDraft("ltp")} /> LTP</label>
+                          <label><input type="radio" name="smart-sort" checked={smartSortDraft === "alpha"} onChange={() => setSmartSortDraft("alpha")} /> Alphabetical</label>
+                          <p className="fwl-smart-pop-title">Exchanges</p>
+                          {["NSE", "BSE", "MCX"].map((exchange) => (
+                            <label key={exchange}>
+                              <input
+                                type="checkbox"
+                                checked={smartExchangesDraft.includes(exchange)}
+                                onChange={() => {
+                                  if (smartExchangesDraft.includes(exchange)) {
+                                    setSmartExchangesDraft((prev) => prev.filter((item) => item !== exchange));
+                                  } else {
+                                    setSmartExchangesDraft((prev) => [...prev, exchange]);
+                                  }
+                                }}
+                              /> {exchange}
+                            </label>
+                          ))}
+                          <div className="fwl-smart-pop-actions">
+                            <button className="btn-primary btn-sm" onClick={handleSmartApplySortFilter}>Apply</button>
+                            <button className="btn-secondary btn-sm" onClick={handleSmartResetSortFilter}>Reset</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="fwl-smart-tool-wrap" ref={smartActionsMenuRef}>
+                      <button
+                        className="fwl-smart-tool-btn"
+                        title="Actions"
+                        onClick={() => setShowSmartActionsMenu((v) => !v)}
+                      >
+                        ⋮
+                      </button>
+                      {showSmartActionsMenu && (
+                        <div className="fwl-smart-popover fwl-smart-actions-menu">
+                          <button onClick={handleSmartAddToMyWatchlist}>Add to my watchlist</button>
+                          <button onClick={() => { setError("Related news integration can be added next."); setShowSmartActionsMenu(false); }}>Related news</button>
+                          <button onClick={() => { setSmartSymbolQuery((selectedSymbol || "").replace("NSE:", "")); setShowSmartActionsMenu(false); }}>Search</button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Search — at top below header */}
+          {watchTab === WATCH_TABS.MY ? (
+            <div className="fwl-search fwl-search-top">
+              <input
+                className="fwl-search-input"
+                placeholder="Search NSE symbol or company…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              {searchLoading && <p className="fwl-hint">Searching…</p>}
+              {searchResults.length > 0 && (
+                <div className="fwl-search-results">
+                  {searchResults.map((item) => (
+                    <div key={item.symbol} className="fwl-sr-row" onClick={() => handleAddSymbol(item.symbol)}>
+                      <div className="fwl-sr-info">
+                        <span className="fwl-sr-sym">{item.symbol.replace("NSE:", "")}</span>
+                        <span className="fwl-sr-name">{item.name}</span>
+                      </div>
+                      <span className="fwl-sr-plus">+</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : watchTab === WATCH_TABS.PREDEFINED ? (
+            <div className="fwl-search fwl-search-top fwl-search-readonly">
+              <p className="fwl-hint">{activeCollectionName} symbols are managed by this tab.</p>
+            </div>
+          ) : (
+            <div className="fwl-search fwl-search-top fwl-smart-search-row">
+              <div className="fwl-smart-meta-row">
+                <span className="fwl-hint">
+                  Last updated {quotesUpdatedAt ? quotesUpdatedAt.toLocaleTimeString("en-IN") : "--:--:--"}
+                </span>
+                <button className="fwl-smart-refresh" onClick={refreshCurrentQuotes} title="Refresh">↻</button>
+              </div>
+              <input
+                className="fwl-search-input"
+                placeholder="Search symbols"
+                value={smartSymbolQuery}
+                onChange={(e) => setSmartSymbolQuery(e.target.value)}
+              />
+            </div>
+          )}
 
           {/* Column headers */}
           <div className="fwl-col-head">
@@ -544,7 +947,7 @@ export default function MarketsPage() {
 
           {/* Rows */}
           <div className="fwl-rows">
-            {activeSymbols.map((symbol) => {
+            {(watchTab === WATCH_TABS.SMART ? smartDisplaySymbols : activeSymbols).map((symbol) => {
               const q = quotes[symbol] || {};
               const chg = Number(q.ch || 0);
               const chgClass = chg > 0 ? "fwl-green" : chg < 0 ? "fwl-red" : "";
@@ -566,36 +969,15 @@ export default function MarketsPage() {
                     className="fwl-row-del"
                     title="Remove from watchlist"
                     onClick={(e) => { e.stopPropagation(); handleRemoveSymbol(activeList, symbol); }}
+                    disabled={watchTab !== WATCH_TABS.MY}
                   >×</button>
                 </div>
               );
             })}
-            {activeSymbols.length === 0 && (
-              <p className="fwl-empty-msg">No symbols. Search below to add.</p>
-            )}
-          </div>
-
-          {/* Search */}
-          <div className="fwl-search">
-            <input
-              className="fwl-search-input"
-              placeholder="Search NSE symbol or company…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-            {searchLoading && <p className="fwl-hint">Searching…</p>}
-            {searchResults.length > 0 && (
-              <div className="fwl-search-results">
-                {searchResults.map((item) => (
-                  <div key={item.symbol} className="fwl-sr-row" onClick={() => handleAddSymbol(item.symbol)}>
-                    <div className="fwl-sr-info">
-                      <span className="fwl-sr-sym">{item.symbol.replace("NSE:", "")}</span>
-                      <span className="fwl-sr-name">{item.name}</span>
-                    </div>
-                    <span className="fwl-sr-plus">+</span>
-                  </div>
-                ))}
-              </div>
+            {(watchTab === WATCH_TABS.SMART ? smartDisplaySymbols.length : activeSymbols.length) === 0 && (
+              <p className="fwl-empty-msg">
+                {watchTab === WATCH_TABS.MY ? "No symbols. Search above to add." : "No symbols available for this collection."}
+              </p>
             )}
           </div>
         </div>

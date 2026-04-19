@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
-import { API_BASE, fetchDashboard, fetchSession, login, logout, placeOrder, runStrategy } from "./api";
+import { API_BASE, fetchDashboard, fetchQuotes, fetchSession, fetchAllNseSymbols, fetchNseSymbolAnalytics, login, logout, placeOrder, runStrategy } from "./api";
 
 const MarketsPage = lazy(() => import("./MarketsPage"));
 const ScannerLayout = lazy(() => import("./ScannerLayout"));
@@ -39,8 +39,40 @@ import {
 
 const SETTINGS_KEY = "tradebuddy-ui-settings";
 const AUTO_CAP_KEY = "tradebuddy-auto-cap";
+const HOME_MARKET_SYMBOLS = [
+  "NSE:NIFTY50-INDEX",
+  "BSE:SENSEX-INDEX",
+  "NSE:NIFTYBANK-INDEX",
+  "BSE:BANKEX-INDEX",
+  "NSE:FINNIFTY-INDEX",
+  "NSE:NIFTYNXT50-INDEX",
+  "NSE:MIDCPNIFTY-INDEX",
+  "NSE:NIFTYMIDCAP100-INDEX",
+  "NSE:NIFTYSMLCAP100-INDEX",
+  "NSE:NIFTY500-INDEX",
+  "NSE:INDIAVIX-INDEX",
+];
+const LEGACY_HOME_SYMBOLS = [
+  "NSE:NIFTY50-INDEX",
+  "NSE:NIFTYBANK-INDEX",
+  "NSE:SBIN-EQ",
+  "NSE:RELIANCE-EQ",
+];
+const HOME_MARKET_LABELS = {
+  "NSE:NIFTY50-INDEX": "NIFTY50",
+  "BSE:SENSEX-INDEX": "SENSEX",
+  "NSE:NIFTYBANK-INDEX": "BANKNIFTY",
+  "BSE:BANKEX-INDEX": "BANKEX",
+  "NSE:FINNIFTY-INDEX": "FINNIFTY",
+  "NSE:NIFTYNXT50-INDEX": "NIFTYNXT50",
+  "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY",
+  "NSE:NIFTYMIDCAP100-INDEX": "NIFTY MIDCAP 100",
+  "NSE:NIFTYSMLCAP100-INDEX": "NIFTY SMLCAP 100",
+  "NSE:NIFTY500-INDEX": "NIFTY 500",
+  "NSE:INDIAVIX-INDEX": "INDIAVIX",
+};
 const DEFAULT_SETTINGS = {
-  watchlistSymbols: "NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:SBIN-EQ,NSE:RELIANCE-EQ",
+  watchlistSymbols: HOME_MARKET_SYMBOLS.join(","),
   liveUpdatesEnabled: true,
   reconnectSeconds: 3,
   strategyAutoInterval: 15,
@@ -76,6 +108,10 @@ function normalizeSymbols(raw) {
     .split(",")
     .map((symbol) => symbol.trim())
     .filter(Boolean);
+}
+
+function homeMarketLabel(symbol) {
+  return HOME_MARKET_LABELS[symbol] || symbolLabel(symbol);
 }
 
 function getTodayKey() {
@@ -139,7 +175,172 @@ function formatCurrency(value) {
   }).format(number);
 }
 
-function SmartChartsBoard({ pnlSeries, watchSeries, holdings }) {
+function formatCompactCurrency(value) {
+  const number = Number(value ?? 0);
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    notation: "compact",
+    maximumFractionDigits: 2,
+  }).format(number);
+}
+
+function firstNumeric(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
+    const number = Number(value);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return null;
+}
+
+function formatSignedCurrency(value, compact = false) {
+  if (value === null || value === undefined) {
+    return "N/A";
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "N/A";
+  }
+  const abs = compact ? formatCompactCurrency(Math.abs(number)) : formatCurrency(Math.abs(number));
+  return `${number > 0 ? "+" : number < 0 ? "-" : ""}${abs}`;
+}
+
+function formatSignedPercent(value) {
+  if (value === null || value === undefined) {
+    return "N/A";
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "N/A";
+  }
+  return `${number > 0 ? "+" : ""}${number.toFixed(2)}%`;
+}
+
+function formatQty(value) {
+  const number = Number(value ?? 0);
+  if (!Number.isFinite(number)) {
+    return "0";
+  }
+  return Number.isInteger(number)
+    ? number.toLocaleString("en-IN")
+    : number.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
+
+function symbolLabel(symbol) {
+  return String(symbol || "")
+    .replace(/^[A-Z]+:/, "")
+    .replace(/-(EQ|INDEX)$/, "");
+}
+
+function symbolExchange(symbol) {
+  return String(symbol || "").split(":")[0] || "NSE";
+}
+
+function valueToneClass(value) {
+  const number = Number(value ?? 0);
+  if (number > 0) return "positive";
+  if (number < 0) return "negative";
+  return "neutral";
+}
+
+function normalizeHoldingRow(item, index) {
+  const quantity = firstNumeric(item.quantity, item.qty, item.netQty) ?? 0;
+  const buyAvg = firstNumeric(item.costPrice, item.buyAvg, item.avgPrice) ?? 0;
+  const ltp = firstNumeric(item.ltp, item.lastPrice) ?? 0;
+  const current = firstNumeric(item.marketVal) ?? quantity * ltp;
+  const totalPnl = firstNumeric(item.pnl, item.pl, item.overallPnl) ?? 0;
+  const invested = buyAvg > 0 && quantity > 0 ? buyAvg * quantity : current - totalPnl;
+  const explicitDayPnl = firstNumeric(item.todayPnl, item.dayPnl, item.today_pl, item.todayPl);
+  const unitChange = firstNumeric(item.ch, item.change, item.netChange);
+  const dayPnl = explicitDayPnl ?? (unitChange !== null ? unitChange * quantity : null);
+  const dayPct = firstNumeric(item.todayPnlPct, item.todayPlPct, item.dayPnlPct, item.dayPnlPercent, item.chp, item.changePercent);
+
+  return {
+    key: item.symbol || `holding-${index}`,
+    symbol: item.symbol || "NSE:UNKNOWN",
+    exchange: symbolExchange(item.symbol),
+    displaySymbol: symbolLabel(item.symbol),
+    quantity,
+    buyAvg,
+    ltp,
+    invested,
+    current,
+    totalPnl,
+    totalPnlPct: invested ? (totalPnl / invested) * 100 : 0,
+    dayPnl,
+    dayPct,
+  };
+}
+
+function normalizePositionRow(item, index) {
+  const quantity = firstNumeric(item.netQty, item.quantity, item.qty) ?? 0;
+  const absoluteQty = Math.abs(quantity);
+  const buyAvg = firstNumeric(item.buyAvg, item.sellAvg, item.avgPrice, item.costPrice) ?? 0;
+  const ltp = firstNumeric(item.ltp, item.lastPrice) ?? 0;
+  const current = firstNumeric(item.marketVal) ?? absoluteQty * ltp;
+  const totalPnl = firstNumeric(item.pl, item.pnl, item.overallPnl) ?? 0;
+  const invested = buyAvg > 0 && absoluteQty > 0 ? absoluteQty * buyAvg : Math.max(current - totalPnl, 0);
+  const explicitDayPnl = firstNumeric(item.todayPnl, item.dayPnl, item.today_pl, item.todayPl);
+  const unitChange = firstNumeric(item.ch, item.change, item.netChange);
+  const dayPnl = explicitDayPnl ?? (unitChange !== null ? unitChange * absoluteQty : null);
+  const dayPct = firstNumeric(item.todayPnlPct, item.todayPlPct, item.dayPnlPct, item.dayPnlPercent, item.chp, item.changePercent);
+
+  return {
+    key: item.symbol || `position-${index}`,
+    symbol: item.symbol || "NSE:UNKNOWN",
+    exchange: symbolExchange(item.symbol),
+    displaySymbol: symbolLabel(item.symbol),
+    quantity,
+    buyAvg,
+    ltp,
+    invested,
+    current,
+    totalPnl,
+    totalPnlPct: invested ? (totalPnl / invested) * 100 : 0,
+    dayPnl,
+    dayPct,
+    sideLabel: quantity > 0 ? "Long" : quantity < 0 ? "Short" : "Flat",
+  };
+}
+
+function summarizePortfolioRows(rows) {
+  const invested = rows.reduce((total, row) => total + Number(row.invested || 0), 0);
+  const current = rows.reduce((total, row) => total + Number(row.current || 0), 0);
+  const totalPnl = rows.reduce((total, row) => total + Number(row.totalPnl || 0), 0);
+  const rowsWithDayPnl = rows.filter((row) => row.dayPnl !== null && row.dayPnl !== undefined);
+  const dayPnl = rowsWithDayPnl.length
+    ? rowsWithDayPnl.reduce((total, row) => total + Number(row.dayPnl || 0), 0)
+    : null;
+  const previousValue = dayPnl !== null ? current - dayPnl : 0;
+  const dayPct = dayPnl !== null && previousValue ? (dayPnl / previousValue) * 100 : dayPnl !== null ? 0 : null;
+
+  return {
+    invested,
+    current,
+    totalPnl,
+    totalPnlPct: invested ? (totalPnl / invested) * 100 : 0,
+    dayPnl,
+    dayPct,
+  };
+}
+
+function formatPriceCell(value) {
+  return value === null || value === undefined ? "--" : formatCurrency(value);
+}
+
+function nseSignalClass(signal) {
+  if (signal === "Strong Buy") return "signal-buy";
+  if (signal === "Strong Sell") return "signal-sell";
+  if (signal === "Strong Hold") return "signal-hold";
+  return "signal-skip";
+}
+
+function SmartChartsBoard({ pnlSeries, holdings }) {
   const allocation = holdings
     .map((item) => {
       const value = Number(item.marketVal ?? Number(item.quantity || 0) * Number(item.ltp || 0));
@@ -159,10 +360,6 @@ function SmartChartsBoard({ pnlSeries, watchSeries, holdings }) {
     }))
     .sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl))
     .slice(0, 6);
-
-  const watchKeys = watchSeries.length
-    ? Object.keys(watchSeries[watchSeries.length - 1]).filter((key) => key !== "time")
-    : [];
 
   return (
     <section className="smartcharts-grid">
@@ -249,29 +446,222 @@ function SmartChartsBoard({ pnlSeries, watchSeries, holdings }) {
           </ResponsiveContainer>
         </div>
       </div>
+    </section>
+  );
+}
 
-      <div className="chart-panel chart-panel-wide">
-        <div className="section-head">
-          <div>
-            <h2>Watchlist Live Trend</h2>
-            <p>Selected symbols from your chip list.</p>
-          </div>
-        </div>
-        <div className="chart-box">
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={watchSeries}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#ece8f8" />
-              <XAxis dataKey="time" tick={{ fontSize: 11 }} />
-              <YAxis tick={{ fontSize: 11 }} />
-              <Tooltip />
-              <Legend />
-              {watchKeys.map((key, index) => (
-                <Line key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[index % CHART_COLORS.length]} dot={false} strokeWidth={2} />
-              ))}
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
+function PortfolioTabbedSection({ holdings, positions }) {
+  const [primaryTab, setPrimaryTab] = useState("holdings");
+  const [secondaryTab, setSecondaryTab] = useState("stocks");
+  const [performanceTab, setPerformanceTab] = useState("all");
+  const [query, setQuery] = useState("");
+
+  const holdingRows = useMemo(() => holdings.map(normalizeHoldingRow), [holdings]);
+  const positionRows = useMemo(() => positions.map(normalizePositionRow), [positions]);
+  const activeRows = primaryTab === "holdings" ? holdingRows : positionRows;
+  const summary = useMemo(() => summarizePortfolioRows(activeRows), [activeRows]);
+  const gainersCount = activeRows.filter((row) => row.totalPnl > 0).length;
+  const losersCount = activeRows.filter((row) => row.totalPnl < 0).length;
+  const activeRowsCount = activeRows.length;
+  const gainersShare = activeRowsCount ? (gainersCount / activeRowsCount) * 100 : 0;
+  const losersShare = activeRowsCount ? (losersCount / activeRowsCount) * 100 : 0;
+
+  const filteredRows = useMemo(() => {
+    if (secondaryTab !== "stocks") {
+      return [];
+    }
+
+    let rows = activeRows;
+    if (performanceTab === "gainers") {
+      rows = rows.filter((row) => row.totalPnl > 0);
+    } else if (performanceTab === "losers") {
+      rows = rows.filter((row) => row.totalPnl < 0);
+    }
+
+    const normalizedQuery = query.trim().toUpperCase();
+    if (!normalizedQuery) {
+      return rows;
+    }
+
+    return rows.filter((row) => (
+      row.displaySymbol.toUpperCase().includes(normalizedQuery)
+      || row.symbol.toUpperCase().includes(normalizedQuery)
+      || row.exchange.toUpperCase().includes(normalizedQuery)
+      || (row.sideLabel || "").toUpperCase().includes(normalizedQuery)
+    ));
+  }, [activeRows, performanceTab, query, secondaryTab]);
+
+  const secondaryTabs = [
+    { id: "stocks", label: "Stocks" },
+    { id: "mutual-funds", label: "Mutual funds" },
+    { id: "pledge", label: "Pledge" },
+    { id: "instant", label: "Instant" },
+  ];
+
+  return (
+    <section className="table-panel portfolio-tab-shell">
+      <div className="portfolio-primary-tabs">
+        <button
+          type="button"
+          className={`portfolio-primary-tab${primaryTab === "positions" ? " active" : ""}`}
+          onClick={() => {
+            setPrimaryTab("positions");
+            setSecondaryTab("stocks");
+            setPerformanceTab("all");
+            setQuery("");
+          }}
+        >
+          Positions
+        </button>
+        <button
+          type="button"
+          className={`portfolio-primary-tab${primaryTab === "holdings" ? " active" : ""}`}
+          onClick={() => {
+            setPrimaryTab("holdings");
+            setSecondaryTab("stocks");
+            setPerformanceTab("all");
+            setQuery("");
+          }}
+        >
+          Holdings
+        </button>
       </div>
+
+      <div className="portfolio-secondary-tabs">
+        {secondaryTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`portfolio-secondary-tab${secondaryTab === tab.id ? " active" : ""}`}
+            onClick={() => {
+              setSecondaryTab(tab.id);
+              setPerformanceTab("all");
+              setQuery("");
+            }}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {secondaryTab === "stocks" ? (
+        <>
+          <div className="portfolio-summary-strip">
+            <div className="portfolio-summary-item">
+              <span className="portfolio-summary-label">Invested</span>
+              <strong className="portfolio-summary-value">{formatCompactCurrency(summary.invested)}</strong>
+            </div>
+            <div className="portfolio-summary-item">
+              <span className="portfolio-summary-label">Current</span>
+              <strong className="portfolio-summary-value">{formatCompactCurrency(summary.current)}</strong>
+            </div>
+            <div className="portfolio-summary-item">
+              <span className="portfolio-summary-label">Today&apos;s P&amp;L</span>
+              <strong className={`portfolio-summary-value ${valueToneClass(summary.dayPnl)}`}>
+                {summary.dayPnl === null ? "N/A" : `${formatSignedCurrency(summary.dayPnl, true)} (${formatSignedPercent(summary.dayPct)})`}
+              </strong>
+            </div>
+            <div className="portfolio-summary-item">
+              <span className="portfolio-summary-label">Total P&amp;L</span>
+              <strong className={`portfolio-summary-value ${valueToneClass(summary.totalPnl)}`}>
+                {`${formatSignedCurrency(summary.totalPnl, true)} (${formatSignedPercent(summary.totalPnlPct)})`}
+              </strong>
+            </div>
+          </div>
+
+          <div className="portfolio-filter-row">
+            <div className="portfolio-pill-group">
+              <button type="button" className={`portfolio-pill${performanceTab === "all" ? " active" : ""}`} onClick={() => setPerformanceTab("all")}>All({activeRowsCount})</button>
+              <button type="button" className={`portfolio-pill${performanceTab === "gainers" ? " active" : ""}`} onClick={() => setPerformanceTab("gainers")}>Gainers({gainersCount})</button>
+              <button type="button" className={`portfolio-pill${performanceTab === "losers" ? " active" : ""}`} onClick={() => setPerformanceTab("losers")}>Losers({losersCount})</button>
+            </div>
+
+            <div className="portfolio-gainers-lossers">
+              <span className="portfolio-gainers-title">Portfolio gainers and losers</span>
+              <div className="portfolio-gainers-meter">
+                <span className="positive">{gainersShare.toFixed(2)}%</span>
+                <div className="portfolio-meter-track">
+                  <div className="portfolio-meter-positive" style={{ width: `${gainersShare}%` }} />
+                  <div className="portfolio-meter-negative" style={{ width: `${losersShare}%` }} />
+                </div>
+                <span className="negative">{losersShare.toFixed(2)}%</span>
+              </div>
+            </div>
+
+            <div className="portfolio-search-slot">
+              <input
+                className="portfolio-search-input"
+                type="text"
+                placeholder={`Search ${primaryTab}...`}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="portfolio-table-wrap">
+            <table className="portfolio-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th className="numeric">Qty</th>
+                  <th className="numeric">Buy Avg</th>
+                  <th className="numeric">LTP</th>
+                  <th className="numeric">Invested</th>
+                  <th className="numeric">Current</th>
+                  <th className="numeric">Total P&amp;L</th>
+                  <th className="numeric">Day&apos;s P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredRows.map((row) => (
+                  <tr key={row.key}>
+                    <td>
+                      <div className="portfolio-symbol-cell">
+                        <span className="portfolio-symbol-main">{row.displaySymbol}</span>
+                        <span className="portfolio-symbol-sub">{primaryTab === "positions" ? `${row.exchange} | ${row.sideLabel}` : row.exchange}</span>
+                      </div>
+                    </td>
+                    <td className="numeric">{formatQty(row.quantity)}</td>
+                    <td className="numeric">{formatCurrency(row.buyAvg)}</td>
+                    <td className="numeric">{formatCurrency(row.ltp)}</td>
+                    <td className="numeric">{formatCurrency(row.invested)}</td>
+                    <td className="numeric">{formatCurrency(row.current)}</td>
+                    <td className="numeric">
+                      <div className={`portfolio-value-stack ${valueToneClass(row.totalPnl)}`}>
+                        <span>{formatSignedCurrency(row.totalPnl)}</span>
+                        <span className="portfolio-value-sub">{formatSignedPercent(row.totalPnlPct)}</span>
+                      </div>
+                    </td>
+                    <td className="numeric">
+                      {row.dayPnl === null ? (
+                        <span className="portfolio-na">N/A</span>
+                      ) : (
+                        <div className={`portfolio-value-stack ${valueToneClass(row.dayPnl)}`}>
+                          <span>{formatSignedCurrency(row.dayPnl)}</span>
+                          <span className="portfolio-value-sub">{formatSignedPercent(row.dayPct)}</span>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {filteredRows.length === 0 ? (
+                  <tr>
+                    <td colSpan="8" className="portfolio-empty-row">
+                      {query ? `No ${primaryTab} matched your search.` : primaryTab === "holdings" ? "No holdings available." : "No positions available."}
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <div className="portfolio-empty-state">
+          <h3>{secondaryTabs.find((tab) => tab.id === secondaryTab)?.label} section</h3>
+          <p>The current FYERS snapshot only exposes stock {primaryTab}. Switch back to Stocks to inspect the live table.</p>
+        </div>
+      )}
     </section>
   );
 }
@@ -321,14 +711,157 @@ function loadStoredSettings() {
     if (!raw) {
       return DEFAULT_SETTINGS;
     }
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const watchlistSymbols = normalizeSymbols(merged.watchlistSymbols || "");
+    if (watchlistSymbols.join(",") === LEGACY_HOME_SYMBOLS.join(",")) {
+      merged.watchlistSymbols = HOME_MARKET_SYMBOLS.join(",");
+    }
+    return merged;
   } catch {
     return DEFAULT_SETTINGS;
   }
 }
 
+function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePage, pageSize }) {
+  const [analyticsBySymbol, setAnalyticsBySymbol] = useState({});
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [analyticsError, setAnalyticsError] = useState("");
+  const filtered = nseFilter
+    ? nseSymbols.filter((s) => {
+        const q = nseFilter.toUpperCase();
+        return (
+          (s.short || "").toUpperCase().includes(q) ||
+          (s.name || "").toUpperCase().includes(q) ||
+          (s.symbol || "").toUpperCase().includes(q)
+        );
+      })
+    : nseSymbols;
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(nsePage, totalPages - 1);
+  const pageRows = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const pageSymbolsKey = pageRows.map((row) => row.symbol).join(",");
+
+  useEffect(() => {
+    if (!pageRows.length) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    setAnalyticsLoading(true);
+    setAnalyticsError("");
+
+    fetchNseSymbolAnalytics(pageRows.map((row) => row.symbol))
+      .then((data) => {
+        if (cancelled) {
+          return;
+        }
+        setAnalyticsBySymbol((current) => ({ ...current, ...(data.results || {}) }));
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setAnalyticsError(err.message || "Unable to load signal analytics for this page.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setAnalyticsLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pageSymbolsKey]);
+
+  return (
+    <div className="table-panel">
+      <div className="table-panel-head">
+        <div>
+          <h3>All NSE Listed Stocks</h3>
+          <p>{nseSymbols.length.toLocaleString()} stocks &middot; Showing {filtered.length.toLocaleString()} match{filtered.length !== 1 ? "es" : ""} &middot; Signal uses up to 8Y daily history for visible rows</p>
+          {analyticsError ? <p className="nse-table-status error-text">{analyticsError}</p> : null}
+          {!analyticsError && analyticsLoading ? <p className="nse-table-status">Loading OHLC + signal analytics for this page...</p> : null}
+        </div>
+        <input
+          className="nse-search-input"
+          type="text"
+          placeholder="Search by name, symbol..."
+          value={nseFilter}
+          onChange={(e) => { setNseFilter(e.target.value); setNsePage(0); }}
+        />
+      </div>
+      <div className="nse-stocks-scroll">
+        <table className="nse-stocks-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Company Name</th>
+              <th className="numeric">LTP</th>
+              <th className="numeric">Today Open</th>
+              <th className="numeric">Today High</th>
+              <th className="numeric">Today Low</th>
+              <th className="numeric">Prev Open</th>
+              <th className="numeric">Prev Close</th>
+              <th>Signal</th>
+              <th>Signal Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageRows.map((s, i) => {
+              const analytics = analyticsBySymbol[s.symbol] || {};
+              const today = analytics.today || {};
+              const yesterday = analytics.yesterday || {};
+              return (
+                <tr key={s.symbol || i}>
+                  <td>{safePage * pageSize + i + 1}</td>
+                  <td>{s.name}</td>
+                  <td className="numeric nse-ltp-cell">{formatPriceCell(today.ltp)}</td>
+                  <td className="numeric">{formatPriceCell(today.open)}</td>
+                  <td className="numeric">{formatPriceCell(today.high)}</td>
+                  <td className="numeric">{formatPriceCell(today.low)}</td>
+                  <td className="numeric">{formatPriceCell(yesterday.open)}</td>
+                  <td className="numeric">{formatPriceCell(yesterday.close)}</td>
+                  <td>
+                    <span className={`nse-signal-chip ${nseSignalClass(analytics.signal)}`} title={analytics.signalNote || "Signal pending"}>
+                      {analytics.signal || (analyticsLoading ? "Loading..." : "Skip")}
+                    </span>
+                  </td>
+                  <td>
+                    <div className="nse-signal-detail">
+                      <span className="nse-signal-note">{analytics.signalNote || "Awaiting signal details"}</span>
+                      <span className="nse-signal-meta">
+                        Score {analytics.signalScore ?? 0} | {analytics.historyPoints || 0} candles
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {pageRows.length === 0 && (
+              <tr>
+                <td colSpan="10" style={{ textAlign: "center", color: "var(--text-muted)", padding: 24 }}>
+                  {nseSymbols.length === 0 ? "Loading NSE symbols..." : "No matches found."}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {totalPages > 1 && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 0" }}>
+          <button className="btn-secondary" disabled={safePage === 0} onClick={() => setNsePage(safePage - 1)}>← Prev</button>
+          <span style={{ fontSize: 13 }}>Page {safePage + 1} of {totalPages}</span>
+          <button className="btn-secondary" disabled={safePage >= totalPages - 1} onClick={() => setNsePage(safePage + 1)}>Next →</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const location = useLocation();
+  const homeMarketSymbolsCsv = HOME_MARKET_SYMBOLS.join(",");
   const [loading, setLoading] = useState(true);
   const [authenticating, setAuthenticating] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
@@ -348,6 +881,10 @@ export default function App() {
   const [strategyAutoRuns, setStrategyAutoRuns] = useState(0);
   const [strategyAutoChecks, setStrategyAutoChecks] = useState(0);
   const [dailyAutoState, setDailyAutoState] = useState(() => loadDailyAutoState());
+  const [nseSymbols, setNseSymbols] = useState([]);
+  const [nseFilter, setNseFilter] = useState("");
+  const [nsePage, setNsePage] = useState(0);
+  const NSE_PAGE_SIZE = 50;
   const [watchlistDraft, setWatchlistDraft] = useState("");
   const [settings, setSettings] = useState(() => loadStoredSettings());
   const [themeMode, setThemeMode] = useState(() => {
@@ -401,6 +938,33 @@ export default function App() {
   }, [dailyAutoState]);
 
   useEffect(() => {
+    if (authenticated) {
+      fetchAllNseSymbols()
+        .then((data) => setNseSymbols(data.results || []))
+        .catch(() => {});
+    }
+  }, [authenticated]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    fetchQuotes(HOME_MARKET_SYMBOLS)
+      .then((data) => {
+        if (!cancelled) {
+          setWatchlist(data.d || []);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated]);
+
+  useEffect(() => {
     if (dailyAutoState.date !== getTodayKey()) {
       setDailyAutoState({ date: getTodayKey(), count: 0 });
     }
@@ -430,7 +994,7 @@ export default function App() {
       const wsBase = API_BASE
         ? API_BASE.replace("http://", "ws://").replace("https://", "wss://")
         : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
-      socket = new WebSocket(`${wsBase}/api/live?symbols=${encodeURIComponent(settings.watchlistSymbols)}`);
+      socket = new WebSocket(`${wsBase}/api/live?symbols=${encodeURIComponent(homeMarketSymbolsCsv)}`);
 
       socket.onopen = () => {
         setConnectionStatus("live");
@@ -498,7 +1062,7 @@ export default function App() {
         socket.close();
       }
     };
-  }, [authenticated, settings.liveUpdatesEnabled, settings.watchlistSymbols, settings.reconnectSeconds]);
+  }, [authenticated, settings.liveUpdatesEnabled, settings.reconnectSeconds, homeMarketSymbolsCsv]);
 
   useEffect(() => {
     if (!authenticated || !strategyAutoEnabled) {
@@ -739,7 +1303,7 @@ export default function App() {
         <div className="login-card">
           <div className="login-brand-icon">TB</div>
           <h1>TradeBuddy</h1>
-          <p>Securely access your FYERS portfolio dashboard.</p>
+          <p>Securely access your FYERS portfolio home page.</p>
           <button
             className="btn-primary"
             style={{ width: "100%", justifyContent: "center", padding: "14px", marginTop: 4 }}
@@ -762,9 +1326,19 @@ export default function App() {
   const trades = dashboard?.tradebook?.tradeBook || dashboard?.tradebook?.tradebook || [];
   const watchlistSymbols = normalizeSymbols(settings.watchlistSymbols);
   const summary = dashboard?.summary || {};
+  const homeMarketRows = useMemo(() => {
+    const rowMap = new Map();
+    watchlist.forEach((item) => {
+      const symbol = item?.n || item?.v?.symbol;
+      if (symbol) {
+        rowMap.set(symbol, item);
+      }
+    });
+    return HOME_MARKET_SYMBOLS.map((symbol) => rowMap.get(symbol) || { n: symbol, v: { symbol } });
+  }, [watchlist]);
 
   const PAGE_TITLES = {
-    "/dashboard": "Dashboard",
+    "/dashboard": "Home Page",
     "/portfolio": "Portfolio",
     "/markets":   "Markets & Watchlists",
     "/scanner":   "Command Deck",
@@ -776,13 +1350,13 @@ export default function App() {
     "/strategy":  "Strategy",
     "/settings":  "Settings",
   };
-  const pageTitle = PAGE_TITLES[location.pathname] || "Dashboard";
+  const pageTitle = PAGE_TITLES[location.pathname] || "Home Page";
 
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good Morning" : hour < 17 ? "Good Afternoon" : "Good Evening";
 
   const MAIN_NAV_ITEMS = [
-    { to: "/dashboard", label: "Dashboard", Icon: IcoDashboard },
+    { to: "/dashboard", label: "Home", Icon: IcoDashboard },
     { to: "/portfolio", label: "Portfolio",  Icon: IcoBriefcase },
     { to: "/markets",   label: "Markets",    Icon: IcoMarkets },
     { to: "/orders",    label: "Orders",     Icon: IcoOrders },
@@ -884,6 +1458,41 @@ export default function App() {
                   <span className="greeting-tag">Live Market</span>
                 </div>
 
+                {/* Watchlist */}
+                <div className="watchlist-row">
+                  {homeMarketRows.map((item) => {
+                    const v = item.v || {};
+                    const chg = Number(v.chp ?? 0);
+                    const symbol = item.n || v.symbol;
+                    return (
+                      <div className="watch-card" key={item.n || v.symbol || Math.random()}>
+                        <div className="sym">{homeMarketLabel(symbol)}</div>
+                        <div className="ltp">{v.lp ?? "–"}</div>
+                        <div className={`chg ${chg >= 0 ? "up" : "dn"}`}>
+                          {chg >= 0 ? "▲" : "▼"} {Math.abs(chg).toFixed(2)}%
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* NSE Listed Stocks */}
+                <NseStocksTable
+                  nseSymbols={nseSymbols}
+                  nseFilter={nseFilter}
+                  setNseFilter={setNseFilter}
+                  nsePage={nsePage}
+                  setNsePage={setNsePage}
+                  pageSize={NSE_PAGE_SIZE}
+                />
+              </>
+            )}
+          />
+
+          <Route
+            path="/portfolio"
+            element={(
+              <>
                 {/* KPI cards */}
                 <div className="kpi-grid">
                   <div className="kpi-card">
@@ -920,78 +1529,10 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Watchlist */}
-                <div className="watchlist-row">
-                  {watchlist.map((item) => {
-                    const v = item.v || {};
-                    const chg = Number(v.chp ?? 0);
-                    return (
-                      <div className="watch-card" key={item.n || v.symbol || Math.random()}>
-                        <div className="sym">{item.n || v.symbol}</div>
-                        <div className="ltp">{v.lp ?? "–"}</div>
-                        <div className={`chg ${chg >= 0 ? "up" : "dn"}`}>
-                          {chg >= 0 ? "▲" : "▼"} {Math.abs(chg).toFixed(2)}%
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
                 {/* Charts */}
-                <SmartChartsBoard pnlSeries={pnlSeries} watchSeries={watchSeries} holdings={holdings} />
-              </>
-            )}
-          />
+                <SmartChartsBoard pnlSeries={pnlSeries} holdings={holdings} />
 
-          <Route
-            path="/portfolio"
-            element={(
-              <>
-                <div className="table-panel">
-                  <div className="table-panel-head">
-                    <div>
-                      <h3>Holdings</h3>
-                      <p>Live from FYERS snapshot and websocket stream.</p>
-                    </div>
-                  </div>
-                  <table>
-                    <thead><tr><th>Symbol</th><th>Qty</th><th>LTP</th><th>P&amp;L</th></tr></thead>
-                    <tbody>
-                      {holdings.map((item) => (
-                        <tr key={item.symbol}>
-                          <td><strong>{item.symbol}</strong></td>
-                          <td>{item.quantity}</td>
-                          <td>{item.ltp}</td>
-                          <td style={{ color: Number(item.pnl || 0) >= 0 ? "var(--success)" : "var(--danger)", fontWeight: 700 }}>{formatCurrency(item.pnl)}</td>
-                        </tr>
-                      ))}
-                      {holdings.length === 0 ? <tr><td colSpan="4" style={{ textAlign: "center", color: "var(--text-muted)", padding: "24px" }}>No holdings available.</td></tr> : null}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="table-panel">
-                  <div className="table-panel-head">
-                    <div>
-                      <h3>Positions</h3>
-                      <p>Live net positions from FYERS.</p>
-                    </div>
-                  </div>
-                  <table>
-                    <thead><tr><th>Symbol</th><th>Qty</th><th>Avg Price</th><th>P&amp;L</th></tr></thead>
-                    <tbody>
-                      {positions.map((item, idx) => (
-                        <tr key={item.symbol || idx}>
-                          <td><strong>{item.symbol}</strong></td>
-                          <td>{item.netQty}</td>
-                          <td>{item.buyAvg || item.sellAvg || "–"}</td>
-                          <td style={{ color: Number(item.pl || item.pnl || 0) >= 0 ? "var(--success)" : "var(--danger)", fontWeight: 700 }}>{formatCurrency(item.pl || item.pnl || 0)}</td>
-                        </tr>
-                      ))}
-                      {positions.length === 0 ? <tr><td colSpan="4" style={{ textAlign: "center", color: "var(--text-muted)", padding: "24px" }}>No open positions.</td></tr> : null}
-                    </tbody>
-                  </table>
-                </div>
+                <PortfolioTabbedSection holdings={holdings} positions={positions} />
               </>
             )}
           />

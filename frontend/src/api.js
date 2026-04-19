@@ -81,6 +81,21 @@ export async function searchSymbols(query) {
   return parse(response);
 }
 
+// ── All NSE symbols ────────────────────────────────────────────────────────
+export async function fetchAllNseSymbols() {
+  const response = await request(`/api/symbols/all`);
+  return parse(response);
+}
+
+export async function fetchNseSymbolAnalytics(symbols) {
+  const response = await request(`/api/symbols/analytics`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbols }),
+  });
+  return parse(response);
+}
+
 // ── Quotes ─────────────────────────────────────────────────────────────────
 export async function fetchQuotes(symbols) {
   const response = await request(`/api/quotes?symbols=${encodeURIComponent(symbols.join(","))}`);
@@ -96,6 +111,11 @@ export async function fetchHistory(symbol, resolution = "5", days = 5) {
 // ── Watchlist CRUD ─────────────────────────────────────────────────────────
 export async function fetchWatchlists() {
   const response = await request(`/api/watchlists`);
+  return parse(response);
+}
+
+export async function fetchWatchlistCatalog() {
+  const response = await request(`/api/watchlists/catalog`);
   return parse(response);
 }
 

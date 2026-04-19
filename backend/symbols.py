@@ -60,7 +60,7 @@ class SymbolMaster:
                 continue
             fyers_symbol = row[9].strip() if len(row) > 9 else ""
             company_name = row[1].strip() if len(row) > 1 else ""
-            short_name = row[14].strip() if len(row) > 14 else ""
+            short_name = row[13].strip() if len(row) > 13 else ""
             isin = row[5].strip() if len(row) > 5 else ""
             if fyers_symbol and company_name:
                 symbols.append(NseSymbol(
