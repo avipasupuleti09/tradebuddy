@@ -3,6 +3,19 @@ import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxi
 import { fetchAllNseSymbols, fetchDashboard, fetchDirectScreener, fetchWatchlistCatalog } from "../../api";
 import { filterSymbolsByNseGroup, getNseGroupOption } from "../../nseGroups";
 import {
+  buildDefaultDirectUniverseSymbols,
+  getCachedDefaultScreenerPayload,
+  getCachedMarketSymbolRows,
+  getCachedWatchlistCatalog,
+  isDefaultUniverse,
+  normalizeMarketCatalogRows,
+  normalizeUniverseSymbol,
+  normalizeUniverseSymbols,
+  setCachedDefaultScreenerPayload,
+  setCachedMarketSymbolRows,
+  setCachedWatchlistCatalog,
+} from "../../lib/dashboardScreenerBootstrap";
+import {
   IcBolt,
   IcChart,
   IcCommand,
@@ -19,24 +32,6 @@ const FAVORITES_STORAGE_KEY = "tradebuddy-dashboard-screener-favorites";
 const QUICK_UNIVERSE_OPTIONS = [
   { id: "market-ranked", label: "All ranked", kind: "preset", value: "market-ranked" },
   { id: "top-200", label: "Top 200 ranked", kind: "basket", value: "top-200" },
-];
-const DEFAULT_DIRECT_GROUP_IDS = [
-  "nifty-50",
-  "niftynxt50",
-  "nifty-midcap-50",
-  "nifty-bank",
-  "fin-nifty",
-  "nifty-it",
-  "nifty-pharma",
-  "nifty-auto",
-  "nifty-fmcg",
-  "nifty-metals",
-  "nifty-commodities",
-  "nifty-energy",
-  "nifty-oil-and-gas",
-  "nifty-healthcare",
-  "gold-silver",
-  "bse-sensex",
 ];
 const DEFAULT_UNIVERSE = QUICK_UNIVERSE_OPTIONS[0];
 const RESULT_VIEWS = [
@@ -288,7 +283,7 @@ export default function DashboardScreenerHub() {
   const [tableSearchOpen, setTableSearchOpen] = useState(false);
   const [tableSort, setTableSort] = useState({ key: "", direction: "desc" });
   const tableSearchInputRef = useRef(null);
-  const directBootstrapRef = useRef(false);
+  const directBootstrapRef = useRef("");
   const shellTabRefreshReadyRef = useRef(false);
 
   useEffect(() => {
@@ -377,17 +372,27 @@ export default function DashboardScreenerHub() {
     || SCREENER_SECTION_TABS[0];
 
   useEffect(() => {
-    if (marketUniverseLoading || directBootstrapRef.current) {
+    if (marketUniverseLoading || !defaultDirectUniverseKey || directBootstrapRef.current === defaultDirectUniverseKey) {
       return;
     }
-    directBootstrapRef.current = true;
     if (!defaultDirectUniverseSymbols.length) {
       setLoading(false);
       setError("Unable to build a direct FYERS screener universe.");
       return;
     }
+    directBootstrapRef.current = defaultDirectUniverseKey;
+
+    const cachedPayload = getCachedDefaultScreenerPayload(defaultDirectUniverseSymbols);
+    if (cachedPayload) {
+      setDashboard(cachedPayload);
+      setActiveScanSymbols(defaultDirectUniverseSymbols);
+      setLastUpdated(formatTimestamp(new Date()));
+      setLoading(false);
+      return;
+    }
+
     void loadDashboard(false, defaultDirectUniverseSymbols);
-  }, [marketUniverseLoading, defaultDirectUniverseSymbols]);
+  }, [marketUniverseLoading, defaultDirectUniverseKey]);
 
   useEffect(() => {
     if (activeShellTab === "screeners" && !activeScanUniverseKey && !defaultDirectUniverseKey) {
@@ -471,12 +476,26 @@ export default function DashboardScreenerHub() {
     const symbolsToScan = Array.isArray(symbols) && symbols.length
       ? normalizeUniverseSymbols(symbols)
       : (activeScanSymbols.length ? activeScanSymbols : defaultDirectUniverseSymbols);
+    const usingDefaultUniverse = isDefaultUniverse(symbolsToScan, defaultDirectUniverseSymbols);
 
     if (!symbolsToScan.length) {
       setError("No symbols are available for the FYERS screener universe.");
       setLoading(false);
       setRefreshing(false);
       return;
+    }
+
+    if (!isRefresh && usingDefaultUniverse) {
+      const cachedPayload = getCachedDefaultScreenerPayload(symbolsToScan);
+      if (cachedPayload) {
+        setError("");
+        setDashboard(cachedPayload);
+        setActiveScanSymbols(symbolsToScan);
+        setLastUpdated(formatTimestamp(new Date()));
+        setLoading(false);
+        setRefreshing(false);
+        return;
+      }
     }
 
     try {
@@ -487,6 +506,9 @@ export default function DashboardScreenerHub() {
         setLoading(true);
       }
       const payload = await fetchDirectScreener(symbolsToScan, Math.min(symbolsToScan.length, 350));
+      if (usingDefaultUniverse) {
+        setCachedDefaultScreenerPayload(symbolsToScan, payload);
+      }
       setDashboard(payload);
       setActiveScanSymbols(symbolsToScan);
       setLastUpdated(formatTimestamp(new Date()));
@@ -499,24 +521,41 @@ export default function DashboardScreenerHub() {
   }
 
   async function loadUniverseCatalog() {
+    const cachedPayload = getCachedWatchlistCatalog();
+    if (cachedPayload) {
+      setUniverseCatalog(cachedPayload);
+    }
+
     try {
-      setUniverseCatalogLoading(true);
+      setUniverseCatalogLoading(!cachedPayload);
       const payload = await fetchWatchlistCatalog();
+      setCachedWatchlistCatalog(payload);
       setUniverseCatalog(payload);
     } catch {
-      setUniverseCatalog(null);
+      if (!cachedPayload) {
+        setUniverseCatalog(null);
+      }
     } finally {
       setUniverseCatalogLoading(false);
     }
   }
 
   async function loadMarketUniverseCatalog() {
+    const cachedRows = getCachedMarketSymbolRows();
+    if (cachedRows.length) {
+      setMarketSymbolRows(cachedRows);
+    }
+
     try {
-      setMarketUniverseLoading(true);
+      setMarketUniverseLoading(!cachedRows.length);
       const payload = await fetchAllNseSymbols();
-      setMarketSymbolRows(payload?.results || []);
+      const rows = Array.isArray(payload?.results) ? payload.results : [];
+      setCachedMarketSymbolRows(rows);
+      setMarketSymbolRows(rows);
     } catch {
-      setMarketSymbolRows([]);
+      if (!cachedRows.length) {
+        setMarketSymbolRows([]);
+      }
     } finally {
       setMarketUniverseLoading(false);
     }
@@ -563,6 +602,9 @@ export default function DashboardScreenerHub() {
         setRefreshing(true);
         setError("");
         const payload = await fetchDirectScreener(universe.symbols, Math.min(universe.symbols.length, 350));
+        if (isDefaultUniverse(universe.symbols, defaultDirectUniverseSymbols)) {
+          setCachedDefaultScreenerPayload(universe.symbols, payload);
+        }
         setDashboard(payload);
         setActiveScanSymbols(normalizeUniverseSymbols(universe.symbols));
         setLastUpdated(formatTimestamp(new Date()));
@@ -1019,7 +1061,7 @@ export default function DashboardScreenerHub() {
               </div>
               <div className="dashboard-screener-modal-foot-actions">
                 <button type="button" className="btn-secondary" onClick={resetUniverse}>Reset</button>
-                <button type="button" className="btn-primary" onClick={applyDraftUniverse}>Apply</button>
+                <button type="button" className="btn-primary dashboard-screener-modal-apply-btn" onClick={applyDraftUniverse}>Apply</button>
               </div>
             </div>
           </div>
@@ -2445,61 +2487,12 @@ function buildMarketUniverseCatalog(symbolRows, fallbackRows = []) {
   };
 }
 
-function normalizeMarketCatalogRows(symbolRows, fallbackRows = []) {
-  if (Array.isArray(symbolRows) && symbolRows.length) {
-    return symbolRows.map((row) => ({
-      symbol: row.symbol || row.Symbol || row.ticker || row.Ticker || "",
-      short: row.short || row.Short || compactTicker(row.symbol || row.Symbol || row.ticker || row.Ticker || ""),
-      name: row.name || row.Name || row.description || row.Description || "",
-    }));
-  }
-
-  return (fallbackRows || []).map((row) => ({
-    symbol: row.Ticker || row.Symbol || row.symbol || "",
-    short: compactTicker(row.Ticker || row.Symbol || row.symbol || ""),
-    name: row.Company || row.Name || row.Sector || compactTicker(row.Ticker || row.Symbol || row.symbol || ""),
-  }));
-}
-
 function buildMarketCatalogText(row) {
   return `${row?.symbol || ""} ${row?.short || ""} ${row?.name || ""}`.toUpperCase();
 }
 
-function buildDefaultDirectUniverseSymbols(symbolRows) {
-  const catalogRows = normalizeMarketCatalogRows(symbolRows, []);
-  if (!catalogRows.length) {
-    return [];
-  }
-
-  const symbols = new Set();
-  DEFAULT_DIRECT_GROUP_IDS.forEach((groupId) => {
-    filterSymbolsByNseGroup(catalogRows, groupId).forEach((row) => {
-      const symbol = normalizeUniverseSymbol(row.symbol || row.Symbol || row.ticker || row.Ticker);
-      if (symbol) {
-        symbols.add(symbol);
-      }
-    });
-  });
-
-  if (symbols.size) {
-    return Array.from(symbols).slice(0, 350);
-  }
-
-  return normalizeUniverseSymbols(catalogRows.slice(0, 250).map((row) => row.symbol));
-}
-
 function requiresUniverseScan(universe) {
   return universe?.scanMode === "broker" || universe?.scanMode === "market";
-}
-
-function normalizeUniverseSymbols(symbols) {
-  return (symbols || [])
-    .map((symbol) => normalizeUniverseSymbol(symbol))
-    .filter(Boolean);
-}
-
-function normalizeUniverseSymbol(symbol) {
-  return String(symbol || "").trim().toUpperCase();
 }
 
 function slugify(value) {
