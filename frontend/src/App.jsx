@@ -1,6 +1,15 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
-import { API_BASE, fetchDashboard, fetchPnlHistory, fetchQuotes, fetchSession, fetchAllNseSymbols, fetchNseSymbolAnalytics, login, logout, placeOrder, runStrategy } from "./api";
+import { API_BASE, fetchDashboard, fetchDirectScreener, fetchPnlHistory, fetchQuotes, fetchSession, fetchAllNseSymbols, fetchNseSymbolAnalytics, fetchWatchlistCatalog, login, logout, placeOrder, runStrategy } from "./api";
+import {
+  buildDefaultDirectUniverseSymbols,
+  getCachedDefaultScreenerPayload,
+  getCachedMarketSymbolRows,
+  setCachedDefaultScreenerPayload,
+  setCachedMarketSymbolRows,
+  setCachedWatchlistCatalog,
+} from "./lib/dashboardScreenerBootstrap";
+import { getNextSortState, sortRowsByAccessor } from "./lib/tableSort";
 import { NSE_STOCK_GROUP_OPTIONS, filterSymbolsByNseGroup, getNseGroupOption } from "./nseGroups";
 
 const MarketsPage = lazy(() => import("./pages/MarketsPage"));
@@ -203,6 +212,56 @@ function firstNumeric(...values) {
   return null;
 }
 
+function firstPositiveNumeric(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) {
+      return number;
+    }
+  }
+  return null;
+}
+
+function maxPositiveNumeric(...values) {
+  let maxValue = null;
+  for (const value of values) {
+    const number = firstPositiveNumeric(value);
+    if (number === null) {
+      continue;
+    }
+    maxValue = maxValue === null ? number : Math.max(maxValue, number);
+  }
+  return maxValue;
+}
+
+function minPositiveNumeric(...values) {
+  let minValue = null;
+  for (const value of values) {
+    const number = firstPositiveNumeric(value);
+    if (number === null) {
+      continue;
+    }
+    minValue = minValue === null ? number : Math.min(minValue, number);
+  }
+  return minValue;
+}
+
+function mergeStableDailyReference(currentReference = {}, analytics = {}, quote = {}) {
+  const today = analytics?.today || {};
+  const yesterday = analytics?.yesterday || {};
+  const liveLtp = firstPositiveNumeric(quote.lp, quote.ltp, today.ltp);
+
+  return {
+    open: firstPositiveNumeric(currentReference.open, quote.open_price, quote.o, today.open),
+    high: maxPositiveNumeric(currentReference.high, quote.high_price, quote.h, liveLtp, today.high),
+    low: minPositiveNumeric(currentReference.low, quote.low_price, quote.l, liveLtp, today.low),
+    prevClose: firstPositiveNumeric(currentReference.prevClose, quote.prev_close_price, quote.prev_close, quote.c, yesterday.close),
+  };
+}
+
 function formatSignedCurrency(value, compact = false) {
   if (value === null || value === undefined) {
     return "N/A";
@@ -399,9 +458,53 @@ function ChartEmptyState({ title, subtitle }) {
   );
 }
 
+function SortableTableHeader({
+  label,
+  sortKey,
+  sortState,
+  onSort,
+  defaultDirection = "asc",
+  align = "left",
+  className = "",
+  sortable = true,
+}) {
+  const active = sortable && sortState?.key === sortKey;
+  const headerTitle = !sortable
+    ? undefined
+    : active
+      ? (sortState.direction === "asc"
+          ? `Sorted ascending by ${label}. Click to sort descending.`
+          : `Sorted descending by ${label}. Click to clear sorting.`)
+      : `Click to sort by ${label}.`;
+  const headerClassName = [
+    className,
+    sortable ? "table-sortable-header" : "",
+    active ? "is-active" : "",
+    align === "right" ? "align-right" : "",
+  ].filter(Boolean).join(" ");
+
+  return (
+    <th
+      className={headerClassName}
+      title={headerTitle}
+      onClick={sortable ? () => onSort(sortKey, defaultDirection) : undefined}
+    >
+      <span className={`table-sort-content${align === "right" ? " align-right" : ""}`}>
+        <span>{label}</span>
+        {sortable ? (
+          <span className={`table-sort-arrow${active ? " active" : ""}`}>
+            {active ? (sortState.direction === "asc" ? "▲" : "▼") : "⇅"}
+          </span>
+        ) : null}
+      </span>
+    </th>
+  );
+}
+
 function HistoricalPnlHeatmap({ trades }) {
   const [symbolQuery, setSymbolQuery] = useState("");
   const [pnlMode, setPnlMode] = useState("combined");
+  const [tradeTableSortState, setTradeTableSortState] = useState({ key: "symbol", direction: "asc" });
   const weekLabels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const [fallbackRows, setFallbackRows] = useState([]);
   const [fallbackLoading, setFallbackLoading] = useState(false);
@@ -496,17 +599,27 @@ function HistoricalPnlHeatmap({ trades }) {
     ));
   }, [normalizedTrades, symbolQuery]);
 
-  const sortedTrades = useMemo(() => [...filteredTrades].sort((a, b) => b.date - a.date), [filteredTrades]);
-  const hasTradeHistory = sortedTrades.length > 0;
+  const tradesByDateDesc = useMemo(() => [...filteredTrades].sort((a, b) => b.date - a.date), [filteredTrades]);
+  const tradeTableRows = useMemo(() => sortRowsByAccessor(tradesByDateDesc, tradeTableSortState, {
+    symbol: (row) => row.displaySymbol,
+    quantity: (row) => row.quantity,
+    buyAvg: (row) => row.buyAvg,
+    buyValue: (row) => row.buyValue,
+    sellAvg: (row) => row.sellAvg,
+    sellValue: (row) => row.sellValue,
+    realizedPnl: (row) => row.realizedPnl,
+    unrealizedPnl: (row) => row.unrealizedPnl,
+  }), [tradesByDateDesc, tradeTableSortState]);
+  const hasTradeHistory = tradesByDateDesc.length > 0;
 
   const dateRange = useMemo(() => {
-    if (!sortedTrades.length) {
+    if (!tradesByDateDesc.length) {
       return { from: null, to: null };
     }
-    const to = sortedTrades[0].date;
-    const from = sortedTrades[sortedTrades.length - 1].date;
+    const to = tradesByDateDesc[0].date;
+    const from = tradesByDateDesc[tradesByDateDesc.length - 1].date;
     return { from, to };
-  }, [sortedTrades]);
+  }, [tradesByDateDesc]);
 
   const dailyMap = useMemo(() => {
     const map = new Map();
@@ -621,13 +734,17 @@ function HistoricalPnlHeatmap({ trades }) {
     return { backgroundColor: `rgba(250, 137, 107, ${strength})` };
   };
 
-  const lastUpdatedText = sortedTrades.length
-    ? sortedTrades[0].date.toLocaleString("en-IN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+  const lastUpdatedText = tradesByDateDesc.length
+    ? tradesByDateDesc[0].date.toLocaleString("en-IN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
     : "No tradebook data";
 
   const dateRangeText = dateRange.from && dateRange.to
     ? `${dateRange.from.toISOString().slice(0, 10)} ~ ${dateRange.to.toISOString().slice(0, 10)}`
     : "No history available";
+
+  function handleTradeTableSort(key, defaultDirection) {
+    setTradeTableSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
 
   return (
     <div className="portfolio-heatmap-shell">
@@ -758,18 +875,18 @@ function HistoricalPnlHeatmap({ trades }) {
         <table className="portfolio-table">
           <thead>
             <tr>
-              <th>Symbol</th>
-              <th className="numeric">Qty.</th>
-              <th className="numeric">Buy avg.</th>
-              <th className="numeric">Buy value</th>
-              <th className="numeric">Sell avg.</th>
-              <th className="numeric">Sell value</th>
-              <th className="numeric">Realised P&amp;L</th>
-              <th className="numeric">Unrealised P&amp;L</th>
+              <SortableTableHeader label="Symbol" sortKey="symbol" sortState={tradeTableSortState} onSort={handleTradeTableSort} />
+              <SortableTableHeader label="Qty." sortKey="quantity" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Buy avg." sortKey="buyAvg" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Buy value" sortKey="buyValue" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Sell avg." sortKey="sellAvg" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Sell value" sortKey="sellValue" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Realised P&amp;L" sortKey="realizedPnl" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Unrealised P&amp;L" sortKey="unrealizedPnl" sortState={tradeTableSortState} onSort={handleTradeTableSort} className="numeric" align="right" defaultDirection="desc" />
             </tr>
           </thead>
           <tbody>
-            {sortedTrades.slice(0, 20).map((row) => (
+            {tradeTableRows.slice(0, 20).map((row) => (
               <tr key={row.key}>
                 <td>
                   <div className="portfolio-symbol-cell">
@@ -794,7 +911,7 @@ function HistoricalPnlHeatmap({ trades }) {
                 </td>
               </tr>
             ))}
-            {sortedTrades.length === 0 ? (
+            {tradeTableRows.length === 0 ? (
               <tr>
                 <td colSpan="8" className="portfolio-empty-row">No tradebook data available for the selected filter.</td>
               </tr>
@@ -995,6 +1112,7 @@ function PortfolioTabbedSection({ holdings, positions, trades }) {
   const [performanceTab, setPerformanceTab] = useState("all");
   const [query, setQuery] = useState("");
   const [portfolioQuotes, setPortfolioQuotes] = useState({});
+  const [portfolioSortState, setPortfolioSortState] = useState({ key: "symbol", direction: "asc" });
 
   const holdingRows = useMemo(() => holdings.map(normalizeHoldingRow), [holdings]);
   const positionRows = useMemo(() => positions.map(normalizePositionRow), [positions]);
@@ -1080,6 +1198,21 @@ function PortfolioTabbedSection({ holdings, positions, trades }) {
       || (row.sideLabel || "").toUpperCase().includes(normalizedQuery)
     ));
   }, [rowsWithLiveDayPnl, performanceTab, query]);
+
+  const sortedRows = useMemo(() => sortRowsByAccessor(filteredRows, portfolioSortState, {
+    symbol: (row) => row.displaySymbol,
+    quantity: (row) => row.quantity,
+    buyAvg: (row) => row.buyAvg,
+    ltp: (row) => row.ltp,
+    invested: (row) => row.invested,
+    current: (row) => row.current,
+    totalPnl: (row) => row.totalPnl,
+    dayPnl: (row) => row.dayPnl,
+  }), [filteredRows, portfolioSortState]);
+
+  function handlePortfolioSort(key, defaultDirection) {
+    setPortfolioSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
 
   return (
     <section className="table-panel portfolio-tab-shell">
@@ -1180,18 +1313,18 @@ function PortfolioTabbedSection({ holdings, positions, trades }) {
             <table className="portfolio-table">
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th className="numeric">Qty</th>
-                  <th className="numeric">Buy Avg</th>
-                  <th className="numeric">LTP</th>
-                  <th className="numeric">Invested</th>
-                  <th className="numeric">Current</th>
-                  <th className="numeric">Total P&amp;L</th>
-                  <th className="numeric">Day&apos;s P&amp;L</th>
+                  <SortableTableHeader label="Symbol" sortKey="symbol" sortState={portfolioSortState} onSort={handlePortfolioSort} />
+                  <SortableTableHeader label="Qty" sortKey="quantity" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
+                  <SortableTableHeader label="Buy Avg" sortKey="buyAvg" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
+                  <SortableTableHeader label="LTP" sortKey="ltp" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
+                  <SortableTableHeader label="Invested" sortKey="invested" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
+                  <SortableTableHeader label="Current" sortKey="current" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
+                  <SortableTableHeader label="Total P&amp;L" sortKey="totalPnl" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
+                  <SortableTableHeader label="Day&apos;s P&amp;L" sortKey="dayPnl" sortState={portfolioSortState} onSort={handlePortfolioSort} className="numeric" align="right" defaultDirection="desc" />
                 </tr>
               </thead>
               <tbody>
-                {filteredRows.map((row) => (
+                {sortedRows.map((row) => (
                   <tr key={row.key}>
                     <td>
                       <div className="portfolio-symbol-cell">
@@ -1222,7 +1355,7 @@ function PortfolioTabbedSection({ holdings, positions, trades }) {
                     </td>
                   </tr>
                 ))}
-                {filteredRows.length === 0 ? (
+                {sortedRows.length === 0 ? (
                   <tr>
                     <td colSpan="8" className="portfolio-empty-row">
                       {query ? `No ${primaryTab} matched your search.` : primaryTab === "holdings" ? "No holdings available." : "No positions available."}
@@ -1239,6 +1372,29 @@ function PortfolioTabbedSection({ holdings, positions, trades }) {
 }
 
 function HistoryTable({ title, subtitle, rows, columns, emptyText, exportName }) {
+  const [sortState, setSortState] = useState(() => ({
+    key: columns[0]?.key || "",
+    direction: columns[0]?.defaultDirection || "asc",
+  }));
+
+  useEffect(() => {
+    if (!columns.some((column) => column.key === sortState.key)) {
+      setSortState({
+        key: columns[0]?.key || "",
+        direction: columns[0]?.defaultDirection || "asc",
+      });
+    }
+  }, [columns, sortState.key]);
+
+  const sortedRows = useMemo(() => sortRowsByAccessor(rows, sortState, Object.fromEntries(columns.map((column) => [
+    column.key,
+    (row) => (column.sortValue ? column.sortValue(row) : column.exportValue ? column.exportValue(row) : row[column.key]),
+  ]))), [rows, sortState, columns]);
+
+  function handleHistorySort(key, defaultDirection) {
+    setSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
+
   return (
     <section className="table-wrap">
       <div className="section-head">
@@ -1254,19 +1410,27 @@ function HistoryTable({ title, subtitle, rows, columns, emptyText, exportName })
         <thead>
           <tr>
             {columns.map((column) => (
-              <th key={column.key}>{column.label}</th>
+              <SortableTableHeader
+                key={column.key}
+                label={column.label}
+                sortKey={column.key}
+                sortState={sortState}
+                onSort={handleHistorySort}
+                defaultDirection={column.defaultDirection || "asc"}
+                sortable={column.sortable !== false}
+              />
             ))}
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, index) => (
+          {sortedRows.map((row, index) => (
             <tr key={`${title}-${row.id || row.orderNumStatus || row.symbol || index}`}>
               {columns.map((column) => (
                 <td key={column.key}>{column.render ? column.render(row) : row[column.key] ?? "-"}</td>
               ))}
             </tr>
           ))}
-          {rows.length === 0 ? (
+          {sortedRows.length === 0 ? (
             <tr>
               <td colSpan={columns.length}>{emptyText}</td>
             </tr>
@@ -1284,6 +1448,7 @@ function loadStoredSettings() {
       return DEFAULT_SETTINGS;
     }
     const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    merged.liveUpdatesEnabled = true;
     const watchlistSymbols = normalizeSymbols(merged.watchlistSymbols || "");
     if (watchlistSymbols.join(",") === LEGACY_HOME_SYMBOLS.join(",")) {
       merged.watchlistSymbols = HOME_MARKET_SYMBOLS.join(",");
@@ -1298,9 +1463,13 @@ function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePa
   const [analyticsBySymbol, setAnalyticsBySymbol] = useState({});
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [analyticsError, setAnalyticsError] = useState("");
+  const [liveQuotesBySymbol, setLiveQuotesBySymbol] = useState({});
+  const [dailyReferenceBySymbol, setDailyReferenceBySymbol] = useState({});
+  const [quotesStreaming, setQuotesStreaming] = useState(false);
   const [groupMenuOpen, setGroupMenuOpen] = useState(false);
   const [groupQuery, setGroupQuery] = useState("");
-  const [activeGroupId, setActiveGroupId] = useState("all");
+  const [activeGroupId, setActiveGroupId] = useState("nifty-50");
+  const [sortState, setSortState] = useState({ key: "company", direction: "asc" });
   const groupMenuRef = useRef(null);
 
   const activeGroup = useMemo(() => getNseGroupOption(activeGroupId), [activeGroupId]);
@@ -1343,10 +1512,61 @@ function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePa
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, [groupMenuOpen]);
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const nameSortedRows = useMemo(() => (
+    sortState.key === "company"
+      ? sortRowsByAccessor(filtered, sortState, { company: (row) => row.name || row.short || row.symbol })
+      : filtered
+  ), [filtered, sortState]);
+
+  const totalPages = Math.max(1, Math.ceil(nameSortedRows.length / pageSize));
   const safePage = Math.min(nsePage, totalPages - 1);
-  const pageRows = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const pageRows = nameSortedRows.slice(safePage * pageSize, (safePage + 1) * pageSize);
   const pageSymbolsKey = pageRows.map((row) => row.symbol).join(",");
+
+  const pageRowsWithLiveData = useMemo(() => pageRows.map((row) => {
+    const analytics = analyticsBySymbol[row.symbol] || {};
+    const today = analytics.today || {};
+    const yesterday = analytics.yesterday || {};
+    const quote = liveQuotesBySymbol[row.symbol] || {};
+    const dailyReference = dailyReferenceBySymbol[row.symbol] || {};
+
+    return {
+      ...row,
+      analytics,
+      today: {
+        ...today,
+        ltp: firstNumeric(quote.lp, quote.ltp, today.ltp),
+        open: firstPositiveNumeric(dailyReference.open, today.open),
+        high: firstPositiveNumeric(dailyReference.high, today.high),
+        low: firstPositiveNumeric(dailyReference.low, today.low),
+      },
+      yesterday: {
+        ...yesterday,
+        close: firstPositiveNumeric(dailyReference.prevClose, yesterday.close),
+      },
+    };
+  }), [pageRows, analyticsBySymbol, liveQuotesBySymbol, dailyReferenceBySymbol]);
+
+  const sortedPageRows = useMemo(() => sortRowsByAccessor(pageRowsWithLiveData, sortState, {
+    company: (row) => row.name || row.short || row.symbol,
+    ltp: (row) => row.today?.ltp,
+    todayOpen: (row) => row.today?.open,
+    todayHigh: (row) => row.today?.high,
+    todayLow: (row) => row.today?.low,
+    prevOpen: (row) => row.yesterday?.open,
+    prevClose: (row) => row.yesterday?.close,
+    signal: (row) => row.analytics?.signal,
+    signalReason: (row) => row.analytics?.signalNote,
+  }), [pageRowsWithLiveData, sortState]);
+  const showTableHeaderStatus = Boolean(analyticsError || analyticsLoading);
+
+  function handleSort(key, defaultDirection) {
+    setSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
+
+  function handleClearSort() {
+    setSortState({ key: null, direction: null });
+  }
 
   useEffect(() => {
     if (!pageRows.length) {
@@ -1362,7 +1582,15 @@ function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePa
         if (cancelled) {
           return;
         }
-        setAnalyticsBySymbol((current) => ({ ...current, ...(data.results || {}) }));
+        const results = data.results || {};
+        setAnalyticsBySymbol((current) => ({ ...current, ...results }));
+        setDailyReferenceBySymbol((current) => {
+          const next = { ...current };
+          Object.entries(results).forEach(([symbol, analytics]) => {
+            next[symbol] = mergeStableDailyReference(next[symbol], analytics, liveQuotesBySymbol[symbol] || {});
+          });
+          return next;
+        });
       })
       .catch((err) => {
         if (!cancelled) {
@@ -1380,15 +1608,140 @@ function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePa
     };
   }, [pageSymbolsKey]);
 
+  useEffect(() => {
+    if (!pageRows.length) {
+      setLiveQuotesBySymbol({});
+      setDailyReferenceBySymbol({});
+      setQuotesStreaming(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    let socket;
+    let reconnectTimer;
+
+    const hydrateQuotes = async () => {
+      try {
+        const data = await fetchQuotes(pageRows.map((row) => row.symbol));
+        if (cancelled) {
+          return;
+        }
+
+        const nextQuotes = {};
+        (data.d || []).forEach((item) => {
+          const symbol = item.n || item.v?.symbol;
+          if (symbol) {
+            nextQuotes[symbol] = item.v || item;
+          }
+        });
+
+        setLiveQuotesBySymbol(nextQuotes);
+        setDailyReferenceBySymbol((current) => {
+          const next = { ...current };
+          Object.entries(nextQuotes).forEach(([symbol, quote]) => {
+            next[symbol] = mergeStableDailyReference(next[symbol], analyticsBySymbol[symbol], quote);
+          });
+          return next;
+        });
+      } catch {
+        // Keep the current snapshot if the one-off hydration fails.
+      }
+    };
+
+    const connect = () => {
+      if (cancelled) {
+        return;
+      }
+
+      const wsBase = API_BASE
+        ? API_BASE.replace("http://", "ws://").replace("https://", "wss://")
+        : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
+      socket = new WebSocket(`${wsBase}/api/live?mode=quotes&symbols=${encodeURIComponent(pageSymbolsKey)}`);
+
+      socket.onopen = () => {
+        if (!cancelled) {
+          setQuotesStreaming(true);
+        }
+      };
+
+      socket.onmessage = (event) => {
+        if (cancelled) {
+          return;
+        }
+
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.status === "error" || payload.type === "error") {
+            setQuotesStreaming(false);
+            return;
+          }
+
+          if (payload.type !== "quote" || !payload.quote) {
+            return;
+          }
+
+          const symbol = payload.quote.symbol || payload.quote.n || payload.quote.v?.symbol;
+          if (!symbol) {
+            return;
+          }
+
+          setLiveQuotesBySymbol((current) => ({
+            ...current,
+            [symbol]: {
+              ...(current[symbol] || {}),
+              ...payload.quote,
+            },
+          }));
+          setDailyReferenceBySymbol((current) => {
+            return {
+              ...current,
+              [symbol]: mergeStableDailyReference(current[symbol], analyticsBySymbol[symbol], payload.quote),
+            };
+          });
+        } catch {
+          setQuotesStreaming(false);
+        }
+      };
+
+      socket.onerror = () => {
+        if (!cancelled) {
+          setQuotesStreaming(false);
+        }
+      };
+
+      socket.onclose = () => {
+        if (!cancelled) {
+          setQuotesStreaming(false);
+          reconnectTimer = window.setTimeout(connect, 3000);
+        }
+      };
+    };
+
+    setLiveQuotesBySymbol({});
+    setQuotesStreaming(false);
+    void hydrateQuotes();
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (socket) {
+        socket.close();
+      }
+    };
+  }, [pageSymbolsKey]);
+
   return (
     <div className="table-panel nse-table-panel">
       <div className="table-panel-head nse-table-panel-head">
-        <div>
-          <h3>All NSE Listed Stocks</h3>
-          <p className="nse-stock-count">{filtered.length.toLocaleString()} stocks</p>
-          {analyticsError ? <p className="nse-table-status error-text">{analyticsError}</p> : null}
-          {!analyticsError && analyticsLoading ? <p className="nse-table-status">Loading OHLC + signal analytics for this page...</p> : null}
-        </div>
+        {showTableHeaderStatus ? (
+          <div className="nse-table-panel-title">
+            {analyticsError ? <p className="nse-table-status error-text">{analyticsError}</p> : null}
+            {!analyticsError && analyticsLoading ? <p className="nse-table-status">Loading OHLC + signal analytics for this page...</p> : null}
+          </div>
+        ) : null}
         <div className="nse-toolbar-controls">
           <div className="nse-group-filter" ref={groupMenuRef}>
             <button
@@ -1437,6 +1790,17 @@ function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePa
             value={nseFilter}
             onChange={(e) => { setNseFilter(e.target.value); setNsePage(0); }}
           />
+          <button
+            type="button"
+            className="btn-secondary nse-clear-sort-btn"
+            onClick={handleClearSort}
+            disabled={!sortState?.key}
+          >
+            Clear sort
+          </button>
+          <span className="nse-stock-count-chip" title={`${filtered.length.toLocaleString()} stocks in ${activeGroup.name}`}>
+            {filtered.length.toLocaleString()} stocks
+          </span>
         </div>
       </div>
       <div className="nse-stocks-scroll">
@@ -1444,22 +1808,22 @@ function NseStocksTable({ nseSymbols, nseFilter, setNseFilter, nsePage, setNsePa
           <thead>
             <tr>
               <th className="nse-index-col">#</th>
-              <th>Company Name</th>
-              <th className="numeric">LTP</th>
-              <th className="numeric">Today Open</th>
-              <th className="numeric">Today High</th>
-              <th className="numeric">Today Low</th>
-              <th className="numeric">Prev Open</th>
-              <th className="numeric">Prev Close</th>
-              <th className="nse-signal-col">Signal</th>
-              <th>Signal Reason</th>
+              <SortableTableHeader label="Company Name" sortKey="company" sortState={sortState} onSort={handleSort} />
+              <SortableTableHeader label="LTP" sortKey="ltp" sortState={sortState} onSort={handleSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Today Open" sortKey="todayOpen" sortState={sortState} onSort={handleSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Today High" sortKey="todayHigh" sortState={sortState} onSort={handleSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Today Low" sortKey="todayLow" sortState={sortState} onSort={handleSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Prev Open" sortKey="prevOpen" sortState={sortState} onSort={handleSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Prev Close" sortKey="prevClose" sortState={sortState} onSort={handleSort} className="numeric" align="right" defaultDirection="desc" />
+              <SortableTableHeader label="Signal" sortKey="signal" sortState={sortState} onSort={handleSort} className="nse-signal-col" />
+              <SortableTableHeader label="Signal Reason" sortKey="signalReason" sortState={sortState} onSort={handleSort} />
             </tr>
           </thead>
           <tbody>
-            {pageRows.map((s, i) => {
-              const analytics = analyticsBySymbol[s.symbol] || {};
-              const today = analytics.today || {};
-              const yesterday = analytics.yesterday || {};
+            {sortedPageRows.map((s, i) => {
+              const analytics = s.analytics || {};
+              const today = s.today || {};
+              const yesterday = s.yesterday || {};
               return (
                 <tr key={s.symbol || i}>
                   <td className="nse-index-col">{safePage * pageSize + i + 1}</td>
@@ -1543,11 +1907,14 @@ export default function App() {
   const [nseFilter, setNseFilter] = useState("");
   const [nsePage, setNsePage] = useState(0);
   const NSE_PAGE_SIZE = 50;
+  const [orderSortState, setOrderSortState] = useState({ key: "symbol", direction: "asc" });
+  const [tradeSortState, setTradeSortState] = useState({ key: "symbol", direction: "asc" });
   const [watchlistDraft, setWatchlistDraft] = useState("");
   const [settings, setSettings] = useState(() => loadStoredSettings());
   const [themeMode, setThemeMode] = useState(() => {
     try { return window.localStorage.getItem(THEME_KEY) || "light"; } catch { return "light"; }
   });
+  const screenerWarmupStartedRef = useRef(false);
   const [orderForm, setOrderForm] = useState({
     symbol: "NSE:SBIN-EQ",
     qty: 1,
@@ -1665,12 +2032,77 @@ export default function App() {
   }, [dailyAutoState]);
 
   useEffect(() => {
-    if (authenticated) {
-      fetchAllNseSymbols()
-        .then((data) => setNseSymbols(data.results || []))
-        .catch(() => {});
+    if (!authenticated) {
+      screenerWarmupStartedRef.current = false;
+      setNseSymbols([]);
+      return undefined;
     }
+
+    const cachedRows = getCachedMarketSymbolRows();
+    if (cachedRows.length) {
+      setNseSymbols(cachedRows);
+    }
+
+    let cancelled = false;
+    fetchAllNseSymbols()
+      .then((data) => {
+        if (cancelled) {
+          return;
+        }
+        const rows = Array.isArray(data?.results) ? data.results : [];
+        setCachedMarketSymbolRows(rows);
+        setNseSymbols(rows);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
   }, [authenticated]);
+
+  useEffect(() => {
+    if (!authenticated || screenerWarmupStartedRef.current || !nseSymbols.length) {
+      return undefined;
+    }
+
+    screenerWarmupStartedRef.current = true;
+    let cancelled = false;
+
+    void (async () => {
+      const defaultSymbols = buildDefaultDirectUniverseSymbols(nseSymbols);
+      if (!defaultSymbols.length) {
+        return;
+      }
+
+      const warmupTasks = [
+        fetchWatchlistCatalog()
+          .then((payload) => {
+            if (!cancelled) {
+              setCachedWatchlistCatalog(payload);
+            }
+          })
+          .catch(() => {}),
+      ];
+
+      if (!getCachedDefaultScreenerPayload(defaultSymbols)) {
+        warmupTasks.push(
+          fetchDirectScreener(defaultSymbols, Math.min(defaultSymbols.length, 350))
+            .then((payload) => {
+              if (!cancelled) {
+                setCachedDefaultScreenerPayload(defaultSymbols, payload);
+              }
+            })
+            .catch(() => {})
+        );
+      }
+
+      await Promise.allSettled(warmupTasks);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, nseSymbols]);
 
   useEffect(() => {
     if (!authenticated) {
@@ -1704,11 +2136,6 @@ export default function App() {
 
   useEffect(() => {
     if (!authenticated) {
-      setConnectionStatus("offline");
-      return undefined;
-    }
-
-    if (!settings.liveUpdatesEnabled) {
       setConnectionStatus("offline");
       return undefined;
     }
@@ -1794,11 +2221,11 @@ export default function App() {
         socket.close();
       }
     };
-  }, [authenticated, settings.liveUpdatesEnabled, settings.reconnectSeconds, homeMarketSymbolsCsv]);
+  }, [authenticated, settings.reconnectSeconds, homeMarketSymbolsCsv]);
 
   // Fallback polling keeps dashboard/watchlist cards fresh when websocket is unavailable.
   useEffect(() => {
-    if (!authenticated || !settings.liveUpdatesEnabled) {
+    if (!authenticated) {
       return undefined;
     }
 
@@ -1848,7 +2275,7 @@ export default function App() {
       window.clearInterval(quoteTimer);
       window.clearInterval(dashboardTimer);
     };
-  }, [authenticated, settings.liveUpdatesEnabled, connectionStatus, location.pathname]);
+  }, [authenticated, connectionStatus, location.pathname]);
 
   useEffect(() => {
     if (!authenticated || !strategyAutoEnabled) {
@@ -2139,6 +2566,29 @@ export default function App() {
     setStrategyAutoEnabled((current) => !current);
   }
 
+  const profile = dashboard?.profile?.data || {};
+  const funds = dashboard?.funds?.fund_limit?.[0] || {};
+  const holdings = dashboard?.holdings?.holdings || [];
+  const positions = dashboard?.positions?.netPositions || [];
+  const orders = dashboard?.orderbook?.orderBook || dashboard?.orderbook?.orderbook || [];
+  const trades = dashboard?.tradebook?.tradeBook || dashboard?.tradebook?.tradebook || [];
+  const sortedOrders = useMemo(() => sortRowsByAccessor(orders, orderSortState, {
+    symbol: (row) => row.symbol,
+    qty: (row) => row.qty ?? row.orderQty,
+    type: (row) => row.type ?? row.orderType,
+    status: (row) => row.status ?? row.orderNumStatus,
+    time: (row) => row.orderDateTime ?? row.orderValidity,
+  }), [orders, orderSortState]);
+  const sortedTradeHistoryRows = useMemo(() => sortRowsByAccessor(trades, tradeSortState, {
+    symbol: (row) => row.symbol,
+    qty: (row) => row.tradedQty ?? row.qty,
+    price: (row) => row.tradePrice ?? row.price,
+    side: (row) => row.side ?? row.orderSide,
+    time: (row) => row.tradeDateTime ?? row.dateTime,
+  }), [trades, tradeSortState]);
+  const watchlistSymbols = normalizeSymbols(settings.watchlistSymbols);
+  const summary = dashboard?.summary || {};
+
   if (loading) {
     return (
       <div className="login-fullpage">
@@ -2224,14 +2674,13 @@ export default function App() {
     );
   }
 
-  const profile = dashboard?.profile?.data || {};
-  const funds = dashboard?.funds?.fund_limit?.[0] || {};
-  const holdings = dashboard?.holdings?.holdings || [];
-  const positions = dashboard?.positions?.netPositions || [];
-  const orders = dashboard?.orderbook?.orderBook || dashboard?.orderbook?.orderbook || [];
-  const trades = dashboard?.tradebook?.tradeBook || dashboard?.tradebook?.tradebook || [];
-  const watchlistSymbols = normalizeSymbols(settings.watchlistSymbols);
-  const summary = dashboard?.summary || {};
+  function handleOrderSort(key, defaultDirection) {
+    setOrderSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
+
+  function handleTradeSort(key, defaultDirection) {
+    setTradeSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
 
   const PAGE_TITLES = {
     "/dashboard": "Home Page",
@@ -2249,6 +2698,7 @@ export default function App() {
 
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good Morning" : hour < 17 ? "Good Afternoon" : "Good Evening";
+  const brokerStreamReady = authenticated && connectionStatus === "live" && Boolean(dashboard);
 
   const MAIN_NAV_ITEMS = [
     { to: "/dashboard", label: "Home", Icon: IcoDashboard },
@@ -2327,7 +2777,6 @@ export default function App() {
             <button className="theme-toggle-btn" title={themeMode === "dark" ? "Switch to light" : "Switch to dark"} onClick={toggleTheme}>
               {themeMode === "dark" ? <IcoSun /> : <IcoMoon />}
             </button>
-            <span className={`status-pill status-${connectionStatus}`}>{connectionStatus}</span>
             <button className="btn-secondary" onClick={() => refreshDashboard()} disabled={refreshing}>
               {refreshing ? "…" : "Refresh"}
             </button>
@@ -2348,7 +2797,9 @@ export default function App() {
                     <h2>{greeting}, {profile.name || profile.display_name || "Trader"}!</h2>
                     <p>Stay updated with your portfolio&rsquo;s performance today.</p>
                   </div>
-                  <span className="greeting-tag">Live Market</span>
+                  <span className={`greeting-tag${brokerStreamReady ? " is-live" : ""}`}>
+                    Live Market
+                  </span>
                 </div>
 
                 {/* Watchlist */}
@@ -2474,10 +2925,10 @@ export default function App() {
                     </button>
                   </div>
                   <table>
-                    <thead><tr><th>Symbol</th><th>Qty</th><th>Type</th><th>Status</th><th>Time</th></tr></thead>
+                    <thead><tr><SortableTableHeader label="Symbol" sortKey="symbol" sortState={orderSortState} onSort={handleOrderSort} /><SortableTableHeader label="Qty" sortKey="qty" sortState={orderSortState} onSort={handleOrderSort} defaultDirection="desc" /><SortableTableHeader label="Type" sortKey="type" sortState={orderSortState} onSort={handleOrderSort} /><SortableTableHeader label="Status" sortKey="status" sortState={orderSortState} onSort={handleOrderSort} /><SortableTableHeader label="Time" sortKey="time" sortState={orderSortState} onSort={handleOrderSort} defaultDirection="desc" /></tr></thead>
                     <tbody>
-                      {orders.map((row, i) => <tr key={row.id||row.orderNumStatus||i}><td><strong>{row.symbol}</strong></td><td>{row.qty??row.orderQty??"-"}</td><td>{row.type??row.orderType??"-"}</td><td>{row.status??row.orderNumStatus??"-"}</td><td>{row.orderDateTime??row.orderValidity??"-"}</td></tr>)}
-                      {orders.length===0?<tr><td colSpan="5" style={{textAlign:"center",color:"var(--text-muted)",padding:"24px"}}>No orders available.</td></tr>:null}
+                      {sortedOrders.map((row, i) => <tr key={row.id||row.orderNumStatus||i}><td><strong>{row.symbol}</strong></td><td>{row.qty??row.orderQty??"-"}</td><td>{row.type??row.orderType??"-"}</td><td>{row.status??row.orderNumStatus??"-"}</td><td>{row.orderDateTime??row.orderValidity??"-"}</td></tr>)}
+                      {sortedOrders.length===0?<tr><td colSpan="5" style={{textAlign:"center",color:"var(--text-muted)",padding:"24px"}}>No orders available.</td></tr>:null}
                     </tbody>
                   </table>
                 </div>
@@ -2493,10 +2944,10 @@ export default function App() {
                     </button>
                   </div>
                   <table>
-                    <thead><tr><th>Symbol</th><th>Qty</th><th>Price</th><th>Side</th><th>Time</th></tr></thead>
+                    <thead><tr><SortableTableHeader label="Symbol" sortKey="symbol" sortState={tradeSortState} onSort={handleTradeSort} /><SortableTableHeader label="Qty" sortKey="qty" sortState={tradeSortState} onSort={handleTradeSort} defaultDirection="desc" /><SortableTableHeader label="Price" sortKey="price" sortState={tradeSortState} onSort={handleTradeSort} defaultDirection="desc" /><SortableTableHeader label="Side" sortKey="side" sortState={tradeSortState} onSort={handleTradeSort} /><SortableTableHeader label="Time" sortKey="time" sortState={tradeSortState} onSort={handleTradeSort} defaultDirection="desc" /></tr></thead>
                     <tbody>
-                      {trades.map((row, i) => <tr key={row.id||i}><td><strong>{row.symbol}</strong></td><td>{row.tradedQty??row.qty??"-"}</td><td>{row.tradePrice??row.price??"-"}</td><td>{row.side??row.orderSide??"-"}</td><td>{row.tradeDateTime??row.dateTime??"-"}</td></tr>)}
-                      {trades.length===0?<tr><td colSpan="5" style={{textAlign:"center",color:"var(--text-muted)",padding:"24px"}}>No trades available.</td></tr>:null}
+                      {sortedTradeHistoryRows.map((row, i) => <tr key={row.id||i}><td><strong>{row.symbol}</strong></td><td>{row.tradedQty??row.qty??"-"}</td><td>{row.tradePrice??row.price??"-"}</td><td>{row.side??row.orderSide??"-"}</td><td>{row.tradeDateTime??row.dateTime??"-"}</td></tr>)}
+                      {sortedTradeHistoryRows.length===0?<tr><td colSpan="5" style={{textAlign:"center",color:"var(--text-muted)",padding:"24px"}}>No trades available.</td></tr>:null}
                     </tbody>
                   </table>
                 </div>
@@ -2580,10 +3031,6 @@ export default function App() {
                     <label>Max Auto Runs<input name="strategyAutoMaxRuns" type="number" min="1" value={settings.strategyAutoMaxRuns} onChange={handleSettingsChange} /></label>
                     <label>Daily Strategy Cap<input name="strategyDailyCap" type="number" min="1" value={settings.strategyDailyCap} onChange={handleSettingsChange} /></label>
                   </div>
-                  <label style={{ flexDirection: "row", alignItems: "center", gap: 8, fontWeight: 500 }}>
-                    <input name="liveUpdatesEnabled" type="checkbox" style={{ width: "auto" }} checked={settings.liveUpdatesEnabled} onChange={handleSettingsChange} />
-                    Enable live websocket updates
-                  </label>
                 </div>
               </div>
             )}

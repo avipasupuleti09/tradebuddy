@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { createChart, ColorType, CrosshairMode, CandlestickSeries, HistogramSeries } from "lightweight-charts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createChart, createSeriesMarkers, ColorType, CrosshairMode, CandlestickSeries, LineSeries, LineStyle } from "lightweight-charts";
 import {
   searchSymbols,
   fetchQuotes,
@@ -10,6 +10,7 @@ import {
   addSymbolToWatchlist,
   removeSymbolFromWatchlist,
 } from "../api";
+import { getNextSortState, sortRowsByAccessor } from "../lib/tableSort";
 
 /* ─── helpers ──────────────────────────────────────────────────────────────── */
 function debounce(fn, ms) {
@@ -23,6 +24,169 @@ function debounce(fn, ms) {
 function formatNum(v) {
   if (v == null) return "-";
   return Number(v).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
+
+function SortableTableHeader({ label, sortKey, sortState, onSort, className = "", align = "left", defaultDirection = "asc" }) {
+  const active = sortState.key === sortKey;
+  return (
+    <th
+      className={[className, "table-sortable-header", active ? "is-active" : "", align === "right" ? "align-right" : ""].filter(Boolean).join(" ")}
+      onClick={() => onSort(sortKey, defaultDirection)}
+    >
+      <span className={`table-sort-content${align === "right" ? " align-right" : ""}`}>
+        <span>{label}</span>
+        <span className={`table-sort-arrow${active ? " active" : ""}`}>{active ? (sortState.direction === "asc" ? "▲" : "▼") : "⇅"}</span>
+      </span>
+    </th>
+  );
+}
+
+const MFI_SIGNAL_LENGTH = 10;
+const MFI_OVERBOUGHT_LEVEL = 80;
+const MFI_OVERSOLD_LEVEL = 20;
+
+function toFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function calculateMfiSeries(candles, length = MFI_SIGNAL_LENGTH) {
+  const mfiSeries = new Array(candles.length).fill(null);
+  const positiveFlow = new Array(candles.length).fill(0);
+  const negativeFlow = new Array(candles.length).fill(0);
+
+  for (let index = 1; index < candles.length; index += 1) {
+    const source = toFiniteNumber(candles[index]?.close);
+    const previousSource = toFiniteNumber(candles[index - 1]?.close);
+    const volume = toFiniteNumber(candles[index]?.volume) ?? 0;
+    if (source === null || previousSource === null) {
+      continue;
+    }
+
+    const rawMoneyFlow = source * volume;
+    if (source > previousSource) {
+      positiveFlow[index] = rawMoneyFlow;
+    } else if (source < previousSource) {
+      negativeFlow[index] = rawMoneyFlow;
+    }
+  }
+
+  let positiveWindow = 0;
+  let negativeWindow = 0;
+
+  for (let index = 0; index < candles.length; index += 1) {
+    positiveWindow += positiveFlow[index];
+    negativeWindow += negativeFlow[index];
+
+    if (index >= length) {
+      positiveWindow -= positiveFlow[index - length];
+      negativeWindow -= negativeFlow[index - length];
+    }
+
+    if (index < length) {
+      continue;
+    }
+
+    if (positiveWindow === 0 && negativeWindow === 0) {
+      mfiSeries[index] = 50;
+      continue;
+    }
+
+    if (negativeWindow === 0) {
+      mfiSeries[index] = 100;
+      continue;
+    }
+
+    const moneyRatio = positiveWindow / negativeWindow;
+    mfiSeries[index] = 100 - (100 / (1 + moneyRatio));
+  }
+
+  return mfiSeries;
+}
+
+function buildMfiArtifacts(candles, length = MFI_SIGNAL_LENGTH) {
+  if (!Array.isArray(candles) || candles.length <= length) {
+    return { series: [], markers: [], lastValue: null };
+  }
+
+  const mfiSeries = calculateMfiSeries(candles, length);
+  const series = [];
+  const markers = [];
+  let lastValue = null;
+
+  for (let index = 0; index < candles.length; index += 1) {
+    const candle = candles[index];
+    const currentMfi = mfiSeries[index];
+    if (currentMfi !== null && candle?.time !== undefined) {
+      const roundedValue = Number(currentMfi.toFixed(2));
+      series.push({ time: candle.time, value: roundedValue });
+      lastValue = roundedValue;
+    }
+
+    if (index === 0) {
+      continue;
+    }
+
+    const previousMfi = mfiSeries[index - 1];
+    if (previousMfi === null || currentMfi === null || candle?.time === undefined) {
+      continue;
+    }
+
+    if (previousMfi > MFI_OVERBOUGHT_LEVEL && currentMfi < MFI_OVERBOUGHT_LEVEL) {
+      markers.push({
+        time: candle.time,
+        position: "aboveBar",
+        color: "#fa896b",
+        shape: "arrowDown",
+        text: "MFI Sell",
+      });
+      continue;
+    }
+
+    if (previousMfi < MFI_OVERSOLD_LEVEL && currentMfi > MFI_OVERSOLD_LEVEL) {
+      markers.push({
+        time: candle.time,
+        position: "belowBar",
+        color: "#13deb9",
+        shape: "arrowUp",
+        text: "MFI Buy",
+      });
+    }
+  }
+
+  return { series, markers, lastValue };
+}
+
+function mergeTickIntoCandles(candles, tickCandle, volume) {
+  const nextCandles = Array.isArray(candles) ? [...candles] : [];
+  if (!tickCandle || tickCandle.time === undefined) {
+    return nextCandles;
+  }
+
+  const mergedCandle = {
+    ...tickCandle,
+    volume: volume ?? 0,
+  };
+
+  if (!nextCandles.length) {
+    return [mergedCandle];
+  }
+
+  const lastCandle = nextCandles[nextCandles.length - 1];
+  if (lastCandle.time === tickCandle.time) {
+    nextCandles[nextCandles.length - 1] = {
+      ...lastCandle,
+      ...tickCandle,
+      volume: volume ?? lastCandle.volume ?? 0,
+    };
+    return nextCandles;
+  }
+
+  if (lastCandle.time < tickCandle.time) {
+    nextCandles.push(mergedCandle);
+  }
+
+  return nextCandles;
 }
 
 
@@ -167,6 +331,7 @@ export default function MarketsPage() {
   const [quotes, setQuotes] = useState({});
   const [quotesUpdatedAt, setQuotesUpdatedAt] = useState(null);
   const quotesTimer = useRef(null);
+  const [watchlistSortState, setWatchlistSortState] = useState({ key: "symbol", direction: "asc" });
 
   // selected row for chart
   const [selectedSymbol, setSelectedSymbol] = useState(null);
@@ -175,6 +340,7 @@ export default function MarketsPage() {
   const [chartSymbol, setChartSymbol] = useState(null);
   const [chartData, setChartData] = useState([]);
   const [chartLoading, setChartLoading] = useState(false);
+  const [mfiInfo, setMfiInfo] = useState(null);
   const [resolution, setResolution] = useState("5");
   const [days, setDays] = useState(5);
   const [isDarkTheme, setIsDarkTheme] = useState(() => document.documentElement.getAttribute("data-theme") === "dark");
@@ -258,6 +424,22 @@ export default function MarketsPage() {
       volume: q.volume ?? q.v,
     };
   });
+
+  const sortedWatchlistRows = useMemo(() => sortRowsByAccessor(selectedWatchlistRows, watchlistSortState, {
+    symbol: (row) => row.symbol.replace(/^NSE:/, ""),
+    ltp: (row) => row.ltp,
+    chg: (row) => row.chg,
+    chgPct: (row) => row.chgPct,
+    open: (row) => row.open,
+    high: (row) => row.high,
+    low: (row) => row.low,
+    prevClose: (row) => row.prevClose,
+    volume: (row) => row.volume,
+  }), [selectedWatchlistRows, watchlistSortState]);
+
+  function handleWatchlistSort(key, defaultDirection) {
+    setWatchlistSortState((current) => getNextSortState(current, key, defaultDirection));
+  }
 
   /* ── Load watchlists on mount ── */
   useEffect(() => {
@@ -403,9 +585,18 @@ export default function MarketsPage() {
   const [ohlcInfo, setOhlcInfo] = useState(null); // crosshair hover info
   const chartContainerRef = useRef(null);
   const chartInstanceRef = useRef(null);
+  const mfiChartContainerRef = useRef(null);
+  const mfiChartInstanceRef = useRef(null);
   const candleSeriesRef = useRef(null);
-  const volumeSeriesRef = useRef(null);
+  const markerSeriesRef = useRef(null);
+  const mfiLineSeriesRef = useRef(null);
   const tickTimerRef = useRef(null);
+  const chartDataRef = useRef([]);
+  const syncingLogicalRangeRef = useRef(false);
+
+  useEffect(() => {
+    chartDataRef.current = chartData;
+  }, [chartData]);
 
   useEffect(() => {
     if (!chartSymbol) return;
@@ -452,14 +643,12 @@ export default function MarketsPage() {
           text: "#c5d7f4",
           grid: "rgba(129, 170, 233, 0.14)",
           border: "rgba(129, 170, 233, 0.22)",
-          volume: "rgba(146, 184, 242, 0.36)",
         }
       : {
           bg: "#ffffff",
           text: "#2a3547",
           grid: "#f0f0f0",
           border: "#e0e0e0",
-          volume: "#c8d6f7",
         };
 
     const chart = createChart(container, {
@@ -508,33 +697,27 @@ export default function MarketsPage() {
       close: c.close,
     })));
 
-    // --- Volume histogram ---
-    const volumeSeries = chart.addSeries(HistogramSeries, {
-      color: chartColors.volume,
-      priceFormat: { type: "volume" },
-      priceScaleId: "volume",
-    });
-    chart.priceScale("volume").applyOptions({
-      scaleMargins: { top: 0.8, bottom: 0 },
-    });
-    volumeSeriesRef.current = volumeSeries;
-    volumeSeries.setData(chartData.map((c) => ({
-      time: c.time,
-      value: c.volume,
-      color: c.close >= c.open ? "rgba(19,222,185,0.3)" : "rgba(250,137,107,0.3)",
-    })));
+    const mfiArtifacts = buildMfiArtifacts(chartData);
+    const markerSeries = createSeriesMarkers(candleSeries);
+    markerSeries.setMarkers(mfiArtifacts.markers);
+    markerSeriesRef.current = markerSeries;
 
     // --- Crosshair OHLC info ---
     const lastCandle = chartData[chartData.length - 1];
+    const mfiSeriesLookup = new Map(mfiArtifacts.series.map((point) => [point.time, point.value]));
     setOhlcInfo(lastCandle);
+    setMfiInfo(mfiArtifacts.lastValue);
 
     chart.subscribeCrosshairMove((param) => {
       if (!param.time) {
         setOhlcInfo(lastCandle);
+        setMfiInfo(mfiArtifacts.lastValue);
         return;
       }
       const d = param.seriesData.get(candleSeries);
       if (d) setOhlcInfo(d);
+      const hoveredMfiValue = mfiSeriesLookup.get(param.time);
+      setMfiInfo(typeof hoveredMfiValue === "number" ? hoveredMfiValue : mfiArtifacts.lastValue);
     });
 
     // Resize observer
@@ -550,9 +733,165 @@ export default function MarketsPage() {
       chart.remove();
       chartInstanceRef.current = null;
       candleSeriesRef.current = null;
-      volumeSeriesRef.current = null;
+      markerSeriesRef.current = null;
     };
   }, [chartData, isDarkTheme]);
+
+  useEffect(() => {
+    if (!mfiChartContainerRef.current || !chartSymbol || chartData.length === 0) {
+      if (mfiChartInstanceRef.current) {
+        mfiChartInstanceRef.current.remove();
+        mfiChartInstanceRef.current = null;
+        mfiLineSeriesRef.current = null;
+      }
+      return;
+    }
+
+    if (mfiChartInstanceRef.current) {
+      mfiChartInstanceRef.current.remove();
+      mfiChartInstanceRef.current = null;
+    }
+
+    const container = mfiChartContainerRef.current;
+    const chartColors = isDarkTheme
+      ? {
+          bg: "#0a1830",
+          text: "#c5d7f4",
+          grid: "rgba(129, 170, 233, 0.14)",
+          border: "rgba(129, 170, 233, 0.22)",
+        }
+      : {
+          bg: "#ffffff",
+          text: "#2a3547",
+          grid: "#f0f0f0",
+          border: "#e0e0e0",
+        };
+
+    const mfiChart = createChart(container, {
+      width: container.clientWidth,
+      height: container.clientHeight || 220,
+      layout: {
+        background: { type: ColorType.Solid, color: chartColors.bg },
+        textColor: chartColors.text,
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: chartColors.grid },
+        horzLines: { color: chartColors.grid },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, vertTouchDrag: true },
+      handleScale: { axisPressedMouseMove: { price: true, time: true }, mouseWheel: true, pinch: true },
+      rightPriceScale: {
+        borderColor: chartColors.border,
+        autoScale: true,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
+      timeScale: {
+        borderColor: chartColors.border,
+        timeVisible: true,
+        secondsVisible: false,
+      },
+    });
+    mfiChartInstanceRef.current = mfiChart;
+
+    const mfiArtifacts = buildMfiArtifacts(chartData);
+    const mfiLineSeries = mfiChart.addSeries(LineSeries, {
+      color: "#5d87ff",
+      lineWidth: 2,
+      crosshairMarkerVisible: true,
+      lastValueVisible: true,
+      priceLineVisible: false,
+      autoscaleInfoProvider: () => ({
+        priceRange: {
+          minValue: 0,
+          maxValue: 100,
+        },
+      }),
+    });
+    mfiLineSeries.setData(mfiArtifacts.series);
+    mfiLineSeriesRef.current = mfiLineSeries;
+
+    mfiLineSeries.createPriceLine({
+      price: MFI_OVERBOUGHT_LEVEL,
+      color: "rgba(250,137,107,0.72)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "80",
+    });
+    mfiLineSeries.createPriceLine({
+      price: MFI_OVERSOLD_LEVEL,
+      color: "rgba(19,222,185,0.72)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "20",
+    });
+    mfiLineSeries.createPriceLine({
+      price: 50,
+      color: "rgba(129,170,233,0.4)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dotted,
+      axisLabelVisible: false,
+    });
+
+    mfiChart.subscribeCrosshairMove((param) => {
+      if (!param.time) {
+        setMfiInfo(mfiArtifacts.lastValue);
+        return;
+      }
+      const point = param.seriesData.get(mfiLineSeries);
+      setMfiInfo(point && typeof point.value === "number" ? point.value : mfiArtifacts.lastValue);
+    });
+
+    const priceChart = chartInstanceRef.current;
+    const syncFromPriceChart = (range) => {
+      if (!range || !mfiChartInstanceRef.current || syncingLogicalRangeRef.current) {
+        return;
+      }
+      syncingLogicalRangeRef.current = true;
+      mfiChartInstanceRef.current.timeScale().setVisibleLogicalRange(range);
+      syncingLogicalRangeRef.current = false;
+    };
+    const syncToPriceChart = (range) => {
+      if (!range || !chartInstanceRef.current || syncingLogicalRangeRef.current) {
+        return;
+      }
+      syncingLogicalRangeRef.current = true;
+      chartInstanceRef.current.timeScale().setVisibleLogicalRange(range);
+      syncingLogicalRangeRef.current = false;
+    };
+
+    if (priceChart) {
+      const visibleRange = priceChart.timeScale().getVisibleLogicalRange();
+      if (visibleRange) {
+        mfiChart.timeScale().setVisibleLogicalRange(visibleRange);
+      } else {
+        mfiChart.timeScale().fitContent();
+      }
+      priceChart.timeScale().subscribeVisibleLogicalRangeChange(syncFromPriceChart);
+      mfiChart.timeScale().subscribeVisibleLogicalRangeChange(syncToPriceChart);
+    } else {
+      mfiChart.timeScale().fitContent();
+    }
+
+    const ro = new ResizeObserver(() => {
+      mfiChart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+    });
+    ro.observe(container);
+
+    return () => {
+      ro.disconnect();
+      if (priceChart) {
+        priceChart.timeScale().unsubscribeVisibleLogicalRangeChange(syncFromPriceChart);
+        mfiChart.timeScale().unsubscribeVisibleLogicalRangeChange(syncToPriceChart);
+      }
+      mfiChart.remove();
+      mfiChartInstanceRef.current = null;
+      mfiLineSeriesRef.current = null;
+    };
+  }, [chartData, chartSymbol, isDarkTheme]);
 
   /* ── Live tick-by-tick updates (poll every 1s) ── */
   useEffect(() => {
@@ -586,12 +925,11 @@ export default function MarketsPage() {
         };
         candleSeriesRef.current.update(tickCandle);
 
-        // Update volume
-        volumeSeriesRef.current.update({
-          time: candleTime,
-          value: q.volume || 0,
-          color: ltp >= (q.open_price || ltp) ? "rgba(19,222,185,0.3)" : "rgba(250,137,107,0.3)",
-        });
+        chartDataRef.current = mergeTickIntoCandles(chartDataRef.current, tickCandle, q.volume || 0);
+        const mfiArtifacts = buildMfiArtifacts(chartDataRef.current);
+        markerSeriesRef.current?.setMarkers(mfiArtifacts.markers);
+        mfiLineSeriesRef.current?.setData(mfiArtifacts.series);
+        setMfiInfo(mfiArtifacts.lastValue);
 
         // Update OHLC header with live values
         setOhlcInfo((prev) => ({
@@ -1000,62 +1338,10 @@ export default function MarketsPage() {
 
         {/* ─── Right: Chart ─── */}
         <div className="wl-main">
-          <div className="panel" style={{ marginBottom: 14 }}>
-            <div className="panel-head" style={{ marginBottom: 8 }}>
-              <div>
-                <h3>Current Watchlist Data</h3>
-                <p>
-                  {activeCollectionName || "Selected watchlist"} · {selectedWatchlistRows.length} symbols
-                </p>
-              </div>
-            </div>
-            <div className="table-wrap" style={{ maxHeight: 260, overflow: "auto" }}>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th className="numeric">LTP</th>
-                    <th className="numeric">Chg</th>
-                    <th className="numeric">Chg%</th>
-                    <th className="numeric">Open</th>
-                    <th className="numeric">High</th>
-                    <th className="numeric">Low</th>
-                    <th className="numeric">Prev Close</th>
-                    <th className="numeric">Volume</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {selectedWatchlistRows.map((row) => {
-                    const chg = Number(row.chg || 0);
-                    const toneClass = chg > 0 ? "cell-positive" : chg < 0 ? "cell-negative" : "";
-                    return (
-                      <tr key={row.symbol}>
-                        <td><strong>{row.symbol.replace("NSE:", "")}</strong></td>
-                        <td className="numeric">{formatNum(row.ltp)}</td>
-                        <td className={`numeric ${toneClass}`}>{formatNum(row.chg)}</td>
-                        <td className={`numeric ${toneClass}`}>{formatNum(row.chgPct)}%</td>
-                        <td className="numeric">{formatNum(row.open)}</td>
-                        <td className="numeric">{formatNum(row.high)}</td>
-                        <td className="numeric">{formatNum(row.low)}</td>
-                        <td className="numeric">{formatNum(row.prevClose)}</td>
-                        <td className="numeric">{formatNum(row.volume)}</td>
-                      </tr>
-                    );
-                  })}
-                  {selectedWatchlistRows.length === 0 && (
-                    <tr>
-                      <td colSpan="9" style={{ textAlign: "center", color: "var(--text-muted)", padding: 20 }}>
-                        No symbols available in the currently selected watchlist.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {chartSymbol ? (
-            <div className="panel chart-panel-full">
+          <div className={`wl-chart-stack${chartSymbol ? " wl-chart-stack-split" : ""}`}>
+            <div className="panel chart-panel-full wl-chart-panel">
+            {chartSymbol ? (
+              <>
               {/* Top bar: bookmarked resolution buttons + dropdown like FYERS */}
               <div className="chart-top-bar">
                 <span className="chart-symbol-label">{chartSymbol.replace("NSE:", "")}</span>
@@ -1130,6 +1416,11 @@ export default function MarketsPage() {
                       )}
                     </span>
                   )}
+                  {mfiInfo !== null ? (
+                    <span className={`chart-ohlc-vals ${mfiInfo >= MFI_OVERBOUGHT_LEVEL ? "fwl-red" : mfiInfo <= MFI_OVERSOLD_LEVEL ? "fwl-green" : ""}`}>
+                      MFI({MFI_SIGNAL_LENGTH}) <b>{formatNum(mfiInfo)}</b>
+                    </span>
+                  ) : null}
                 </div>
 
               </div>
@@ -1198,12 +1489,96 @@ export default function MarketsPage() {
                   >auto</button>
                 </div>
               </div>
+              </>
+            ) : (
+              <div className="chart-box wl-chart-empty-box">
+                <div className="chart-empty-state wl-chart-empty-state">
+                  <strong>Select a symbol to view the chart</strong>
+                  <span>The chart panel now stays on top and takes most of the workspace for visual analysis.</span>
+                </div>
+              </div>
+            )}
             </div>
-          ) : (
-            <div className="panel" style={{ padding: 48, textAlign: "center", color: "var(--text-muted)" }}>
-              <p style={{ fontSize: 16 }}>Click on a symbol to view its live chart</p>
+
+            {chartSymbol ? (
+              <div className="panel chart-panel-full wl-mfi-panel">
+                <div className="panel-head wl-mfi-panel-head">
+                  <div>
+                    <h3>MFI Oscillator</h3>
+                    <p>{chartSymbol.replace("NSE:", "")} · Money Flow Index ({MFI_SIGNAL_LENGTH})</p>
+                  </div>
+                  {mfiInfo !== null ? (
+                    <span className={`wl-mfi-value-chip ${mfiInfo >= MFI_OVERBOUGHT_LEVEL ? "wl-mfi-value-chip-sell" : mfiInfo <= MFI_OVERSOLD_LEVEL ? "wl-mfi-value-chip-buy" : ""}`}>
+                      {formatNum(mfiInfo)}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="chart-box wl-mfi-chart-box">
+                  {chartLoading ? (
+                    <p className="fwl-hint" style={{ padding: 32 }}>Loading MFI…</p>
+                  ) : chartData.length === 0 ? (
+                    <p className="fwl-hint" style={{ padding: 32 }}>No MFI data for this range.</p>
+                  ) : (
+                    <div ref={mfiChartContainerRef} className="lw-chart-container" />
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="panel wl-data-panel">
+            <div className="panel-head wl-data-panel-head">
+              <div>
+                <h3>Current Watchlist Data</h3>
+                <p>
+                  {activeCollectionName || "Selected watchlist"} · {selectedWatchlistRows.length} symbols
+                </p>
+              </div>
             </div>
-          )}
+            <div className="table-wrap wl-data-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <SortableTableHeader label="Symbol" sortKey="symbol" sortState={watchlistSortState} onSort={handleWatchlistSort} />
+                    <SortableTableHeader label="LTP" sortKey="ltp" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="Chg" sortKey="chg" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="Chg%" sortKey="chgPct" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="Open" sortKey="open" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="High" sortKey="high" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="Low" sortKey="low" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="Prev Close" sortKey="prevClose" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                    <SortableTableHeader label="Volume" sortKey="volume" sortState={watchlistSortState} onSort={handleWatchlistSort} className="numeric" align="right" defaultDirection="desc" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedWatchlistRows.map((row) => {
+                    const chg = Number(row.chg || 0);
+                    const toneClass = chg > 0 ? "cell-positive" : chg < 0 ? "cell-negative" : "";
+                    return (
+                      <tr key={row.symbol}>
+                        <td><strong>{row.symbol.replace("NSE:", "")}</strong></td>
+                        <td className="numeric">{formatNum(row.ltp)}</td>
+                        <td className={`numeric ${toneClass}`}>{formatNum(row.chg)}</td>
+                        <td className={`numeric ${toneClass}`}>{formatNum(row.chgPct)}%</td>
+                        <td className="numeric">{formatNum(row.open)}</td>
+                        <td className="numeric">{formatNum(row.high)}</td>
+                        <td className="numeric">{formatNum(row.low)}</td>
+                        <td className="numeric">{formatNum(row.prevClose)}</td>
+                        <td className="numeric">{formatNum(row.volume)}</td>
+                      </tr>
+                    );
+                  })}
+                  {sortedWatchlistRows.length === 0 && (
+                    <tr>
+                      <td colSpan="9" style={{ textAlign: "center", color: "var(--text-muted)", padding: 20 }}>
+                        No symbols available in the currently selected watchlist.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </div>
     </div>

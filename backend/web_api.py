@@ -4,12 +4,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from bisect import bisect_left
 import json
 import os
-from threading import Lock
+from queue import Empty, Queue
+from threading import Event, Lock
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
+from fyers_apiv3.FyersWebsocket import data_ws
 from flask import Flask, jsonify, redirect, request
 from flask_cors import CORS
 from flask_sock import Sock
@@ -49,6 +51,14 @@ def create_app() -> Flask:
     analytics_cache_file = Path(os.getenv("NSE_ANALYTICS_CACHE_FILE", ".cache/nse_analytics_cache.json")).resolve()
     history_signal_cache: dict[str, tuple[float, dict]] = {}
     history_signal_cache_lock = Lock()
+    quote_stream_lock = Lock()
+    quote_stream_state: dict[str, object] = {
+        "client": None,
+        "connected": False,
+        "clients": {},
+        "next_client_id": 1,
+        "symbol_ref_counts": {},
+    }
 
     _MAX_ANALYTICS_SYMBOLS = 50
     _MAX_DIRECT_SCREENER_SYMBOLS = 350
@@ -196,6 +206,151 @@ def create_app() -> Flask:
         if not access_token:
             raise RuntimeError("No access token found. Please login first.")
         return FyersApiService(client_id=settings.client_id, access_token=access_token)
+
+    def enqueue_quote_stream_event(queue: Queue, payload: dict) -> None:
+        try:
+            queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def ensure_quote_stream() -> tuple[object | None, bool]:
+        with quote_stream_lock:
+            existing_client = quote_stream_state["client"]
+            existing_connected = bool(quote_stream_state["connected"])
+        if existing_client is not None:
+            return existing_client, existing_connected
+
+        token_payload = TokenStore(settings.token_file).load()
+        access_token = token_payload.get("access_token", "")
+        if not access_token:
+            raise RuntimeError("No access token found. Please login first.")
+
+        def on_message(message):
+            if not isinstance(message, dict) or not message.get("symbol"):
+                return
+            symbol = str(message.get("symbol"))
+            with quote_stream_lock:
+                client_entries = list(quote_stream_state["clients"].values())
+            for client_entry in client_entries:
+                if symbol in client_entry["symbols"]:
+                    enqueue_quote_stream_event(client_entry["queue"], {"type": "quote", "quote": message})
+
+        def on_error(message):
+            error_message = message.get("message") if isinstance(message, dict) else str(message)
+            with quote_stream_lock:
+                quote_stream_state["connected"] = False
+                client_entries = list(quote_stream_state["clients"].values())
+            for client_entry in client_entries:
+                enqueue_quote_stream_event(client_entry["queue"], {"type": "error", "message": error_message})
+
+        def on_close(message):
+            close_message = message.get("message") if isinstance(message, dict) else str(message)
+            with quote_stream_lock:
+                quote_stream_state["connected"] = False
+                client_entries = list(quote_stream_state["clients"].values())
+            for client_entry in client_entries:
+                enqueue_quote_stream_event(client_entry["queue"], {"type": "closed", "message": close_message})
+
+        def on_connect():
+            with quote_stream_lock:
+                quote_stream_state["connected"] = True
+                client = quote_stream_state["client"]
+                symbols_to_subscribe = list(quote_stream_state["symbol_ref_counts"].keys())
+                client_entries = list(quote_stream_state["clients"].values())
+            if client is not None:
+                if symbols_to_subscribe:
+                    client.subscribe(symbols=symbols_to_subscribe, data_type="SymbolUpdate")
+                client.keep_running()
+            for client_entry in client_entries:
+                enqueue_quote_stream_event(client_entry["queue"], {"type": "ready"})
+
+        client = data_ws.FyersDataSocket(
+            access_token=access_token,
+            log_path="",
+            litemode=False,
+            write_to_file=False,
+            reconnect=True,
+            on_connect=on_connect,
+            on_close=on_close,
+            on_error=on_error,
+            on_message=on_message,
+        )
+
+        with quote_stream_lock:
+            if quote_stream_state["client"] is None:
+                quote_stream_state["client"] = client
+                stored_client = client
+            else:
+                stored_client = quote_stream_state["client"]
+
+        if stored_client is client:
+            client.connect()
+
+        with quote_stream_lock:
+            return quote_stream_state["client"], bool(quote_stream_state["connected"])
+
+    def register_quote_stream_client(symbols: list[str]) -> tuple[int, Queue]:
+        normalized_symbols = {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
+        if not normalized_symbols:
+            raise RuntimeError("No symbols provided for quote streaming.")
+
+        event_queue: Queue = Queue()
+        with quote_stream_lock:
+            client_id = int(quote_stream_state["next_client_id"])
+            quote_stream_state["next_client_id"] = client_id + 1
+            quote_stream_state["clients"][client_id] = {
+                "symbols": normalized_symbols,
+                "queue": event_queue,
+            }
+            subscribe_now = []
+            for symbol in normalized_symbols:
+                current_count = int(quote_stream_state["symbol_ref_counts"].get(symbol, 0))
+                if current_count == 0:
+                    subscribe_now.append(symbol)
+                quote_stream_state["symbol_ref_counts"][symbol] = current_count + 1
+            connected = bool(quote_stream_state["connected"])
+
+        client, _ = ensure_quote_stream()
+        if connected:
+            enqueue_quote_stream_event(event_queue, {"type": "ready"})
+            if client is not None and subscribe_now:
+                client.subscribe(symbols=subscribe_now, data_type="SymbolUpdate")
+        return client_id, event_queue
+
+    def unregister_quote_stream_client(client_id: int) -> None:
+        with quote_stream_lock:
+            client_entry = quote_stream_state["clients"].pop(client_id, None)
+            client = quote_stream_state["client"]
+            connected = bool(quote_stream_state["connected"])
+            unsubscribe_now = []
+            if client_entry is not None:
+                for symbol in client_entry["symbols"]:
+                    current_count = int(quote_stream_state["symbol_ref_counts"].get(symbol, 0))
+                    if current_count <= 1:
+                        quote_stream_state["symbol_ref_counts"].pop(symbol, None)
+                        unsubscribe_now.append(symbol)
+                    else:
+                        quote_stream_state["symbol_ref_counts"][symbol] = current_count - 1
+
+        if client is not None and connected and unsubscribe_now:
+            try:
+                client.unsubscribe(symbols=unsubscribe_now, data_type="SymbolUpdate")
+            except Exception:
+                pass
+
+    def stream_quotes(socket, symbols: list[str]) -> None:
+        stop_event = Event()
+        client_id, event_queue = register_quote_stream_client(symbols)
+        try:
+            while not stop_event.is_set():
+                try:
+                    payload = event_queue.get(timeout=10)
+                except Empty:
+                    continue
+                socket.send(json.dumps({"mode": "quotes", **payload}))
+        finally:
+            stop_event.set()
+            unregister_quote_stream_client(client_id)
 
     def map_side(raw: str) -> int:
         return 1 if raw.upper() == "BUY" else -1
@@ -433,11 +588,17 @@ def create_app() -> Flask:
     @sock.route("/api/live")
     def live(socket) -> None:
         try:
-            api = load_api()
             query_symbols = request.args.get("symbols", "")
+            mode = str(request.args.get("mode", "")).strip().lower()
             symbols = [symbol.strip() for symbol in query_symbols.split(",") if symbol.strip()]
             if not symbols:
                 symbols = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:SBIN-EQ", "NSE:RELIANCE-EQ"]
+
+            if mode == "quotes":
+                stream_quotes(socket, symbols)
+                return
+
+            api = load_api()
 
             while True:
                 payload = build_dashboard_payload(api)
