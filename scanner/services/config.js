@@ -56,10 +56,7 @@ function defaultBackendApiBase() {
     return process.env.BACKEND_API_BASE
   }
 
-  const hostedMode = process.argv.includes('--hosted')
-  const port = hostedMode
-    ? Number(process.env.PORT || 3000)
-    : Number(process.env.BACKEND_PORT || 5000)
+  const port = Number(process.env.BACKEND_PORT || 5000)
 
   return `http://127.0.0.1:${port}`
 }
