@@ -66,6 +66,7 @@ const INTRADAY_HISTORY_CACHE_TTL_SECONDS = 3 * 60;
 const DAILY_HISTORY_STALE_TTL_SECONDS = 3 * 24 * 60 * 60;
 const INTRADAY_HISTORY_STALE_TTL_SECONDS = 15 * 60;
 const HISTORY_ROWS_CACHE_PERSIST_DEBOUNCE_MS = 1500;
+const DASHBOARD_REQUEST_COOLDOWN_MS = 1500;
 const ACCOUNT_PROFILE_FIELDS = ['firstName', 'lastName', 'email', 'phone', 'state', 'city', 'timezone'];
 const ACCOUNT_PROFILE_DIRNAME = 'profile';
 const ACCOUNT_PROFILE_FILENAME = 'account-profile.json';
@@ -670,6 +671,11 @@ export function createBackendService() {
   let historySignalCacheLoaded = false;
   let historyRowsCacheLoaded = false;
   let historyRowsPersistTimer = null;
+  let dashboardPayloadPromise = null;
+  let dashboardPayloadCache = null;
+  let dashboardPayloadCacheExpiresAt = 0;
+  let dashboardPayloadErrorMessage = '';
+  let dashboardPayloadErrorExpiresAt = 0;
 
   app.use(cors({ origin: true }));
   app.use(express.json({ limit: '1mb' }));
@@ -782,6 +788,45 @@ export function createBackendService() {
       throw new Error('No access token found. Please login first.');
     }
     return new FyersApiService({ clientId: settings.clientId, accessToken });
+  }
+
+  async function loadDashboardPayload(api) {
+    const now = Date.now();
+
+    if (dashboardPayloadCache && dashboardPayloadCacheExpiresAt > now) {
+      return dashboardPayloadCache;
+    }
+
+    if (dashboardPayloadErrorMessage && dashboardPayloadErrorExpiresAt > now) {
+      throw new Error(dashboardPayloadErrorMessage);
+    }
+
+    if (dashboardPayloadPromise) {
+      return dashboardPayloadPromise;
+    }
+
+    // Collapse overlapping dashboard refreshes so one UI burst does not fan out
+    // into duplicate broker HTTPS calls on the same TLS socket.
+    dashboardPayloadPromise = buildDashboardPayload(api)
+      .then((payload) => {
+        dashboardPayloadCache = payload;
+        dashboardPayloadCacheExpiresAt = Date.now() + DASHBOARD_REQUEST_COOLDOWN_MS;
+        dashboardPayloadErrorMessage = '';
+        dashboardPayloadErrorExpiresAt = 0;
+        return payload;
+      })
+      .catch((error) => {
+        dashboardPayloadCache = null;
+        dashboardPayloadCacheExpiresAt = 0;
+        dashboardPayloadErrorMessage = error?.message || 'Unable to load dashboard.';
+        dashboardPayloadErrorExpiresAt = Date.now() + DASHBOARD_REQUEST_COOLDOWN_MS;
+        throw error;
+      })
+      .finally(() => {
+        dashboardPayloadPromise = null;
+      });
+
+    return dashboardPayloadPromise;
   }
 
   async function loadWatchlists() {
@@ -1624,7 +1669,7 @@ export function createBackendService() {
   app.get('/api/dashboard', async (_req, res) => {
     try {
       const api = await loadApi();
-      res.json(await buildDashboardPayload(api));
+      res.json(await loadDashboardPayload(api));
     } catch (error) {
       res.status(401).json({ status: 'error', message: error.message });
     }
@@ -2210,7 +2255,7 @@ export function createBackendService() {
       const sendPayload = async () => {
         try {
           const api = await loadApi();
-          const payload = await buildDashboardPayload(api);
+          const payload = await loadDashboardPayload(api);
           payload.watchlist = await api.quotes(targetSymbols);
           if (ws.readyState === 1) {
             ws.send(JSON.stringify(payload));

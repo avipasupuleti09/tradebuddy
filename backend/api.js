@@ -1,6 +1,19 @@
+import http from 'node:http';
+import https from 'node:https';
+import { createRequire } from 'node:module';
 import fyersPackage from 'fyers-api-v3';
 
 const { fyersModel } = fyersPackage;
+const require = createRequire(import.meta.url);
+const { axiosInstance } = require('fyers-api-v3/apiService/apiService.js');
+
+// FYERS SDK shares one keep-alive axios agent across requests, which can trip
+// TLS socket listener warnings under bursty dashboard refreshes. Use plain agents
+// here so requests do not accumulate listeners on the same reused socket.
+if (axiosInstance?.defaults) {
+  axiosInstance.defaults.httpAgent = new http.Agent({ keepAlive: false });
+  axiosInstance.defaults.httpsAgent = new https.Agent({ keepAlive: false });
+}
 
 function toUnixRange(dateValue, isEndOfDay = false) {
   const date = new Date(dateValue);
